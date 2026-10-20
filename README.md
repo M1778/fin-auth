@@ -163,9 +163,16 @@ and the `clock_gettime` import are excluded from that Windows branch. The option
 hash benchmark uses Linux/macOS monotonic clock IDs; Windows skips timing but
 still hashes and verifies the emitted 600,000-iteration policy metadata.
 
-Native Windows and macOS build/run validation is **pending CI**; Linux O0/O2
-results above do not establish native compatibility. Windows also requires the
-coordinated fin-crypto Windows RNG implementation. No CI result is claimed here.
+Native Windows and macOS validation is **blocked by missing target macros in
+published Fin revision `1f7afd97`**, not merely awaiting CI. The native matrix
+found that this compiler does not define `FIN_TARGET_WINDOWS` or
+`FIN_TARGET_DARWIN`: Windows therefore selects POSIX declarations and fails to
+link `fork`, `waitpid`, and `clock_gettime`; macOS selects the Linux clock ID.
+The target definitions exist only in an uncommitted local compiler change.
+Linux O0/O2 tests pass, but they do not establish native Windows/macOS support.
+A published compiler with these target definitions is required before the
+platform branches above can select correctly; no compiler changes are included
+in this library.
 
 `auth_crypt::fin` is a separate optional POSIX/libcrypt module, never imported by
 `auth::fin` or the core test suite. Windows users must not build its optional test
