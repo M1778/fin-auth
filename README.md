@@ -31,7 +31,7 @@ Then `import { ... } from auth::fin;`.
 
 ## Dependencies
 
-- [`M1778/fin-crypto@0.1.0`](https://github.com/M1778/fin-crypto) — HMAC-SHA256,
+- [`M1778/fin-crypto@0.1.1`](https://github.com/M1778/fin-crypto) — HMAC-SHA256,
   `random_bytes` / `random_hex`, `const_time_eq`.
 - [`M1778/finson@0.1.0`](https://github.com/M1778/finson) — claim extraction
   from JWT payloads.
@@ -92,13 +92,16 @@ header segment against the fixed expected value (no algorithm confusion).
 
 ## Verification status
 
-**UNVERIFIED** — no working `finc` binary was available in the build
-environment. The test suite covers: base64url round-trips, two
-PBKDF2-HMAC-SHA256 vectors from Python `hashlib.pbkdf2_hmac`, password
-hash/verify round-trips, a `crypt(3)` `$6$` vector from Python's `crypt`
-module (asserted only when linking succeeds), a Python-generated JWT HS256
-vector plus tamper/`alg=none`/malformed rejections, claim/`exp` handling,
-and the session store lifecycle.
+**VERIFIED 2026-10-20** — built and executed with finc 0.4.0 (contract 3).
+`tests/test_auth.fin` passes: base64url round-trips, two PBKDF2-HMAC-SHA256
+vectors from Python `hashlib.pbkdf2_hmac`, password hash/verify round-trips,
+a Python-generated JWT HS256 vector plus tamper/`alg=none`/malformed
+rejections, claim/`exp` handling, and the session store lifecycle.
+`tests/test_auth_crypt.fin` passes with `-lcrypt` (FIN_CC wrapper): the
+`crypt(3)` `$6$` vector matches Python's `crypt` module, and bad settings
+are rejected via crypt's `*0`/`*1` convention. `examples/basic.fin` runs
+end-to-end (register → login → JWT → session → CSRF).
+
 
 ## Known limitations (v0.1.0)
 

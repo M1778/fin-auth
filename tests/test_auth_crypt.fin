@@ -1,0 +1,19 @@
+// crypt(3) FFI test — needs -lcrypt at link time.
+//
+// Run: printf '#!/bin/sh\nexec cc "$@" -lcrypt\n' > /tmp/fincc && chmod +x /tmp/fincc
+//      FIN_CC=/tmp/fincc finc tests/test_auth_crypt.fin -I src -o test_auth_crypt && ./test_auth_crypt
+//
+// Vector from Python's crypt module: crypt("password", "$6$saltysalt$").
+
+import { password_hash_crypt, CryptResult } from auth_crypt::fin;
+import { assert_true } from testing::std;
+import { equals } from strings::std;
+
+fun main() <noret> {
+    let cr <CryptResult> = password_hash_crypt("password", "$6$saltysalt$");
+    assert_true(cr.ok, "crypt(3) call succeeded");
+    assert_true(equals(cr.hash, "$6$saltysalt$gl2Dp0z9fD2n7opP4xJXmrqHVOUVPL1xc/nwGYUcLsTPSMv3wI0wU8NZwNkdtnjn8ycwtOv/t9gt.rn4H4h2b."), "crypt(3) $6$ != Python vector");
+    let bad <CryptResult> = password_hash_crypt("password", "$9$invalid$");
+    assert_true(!bad.ok, "bad setting rejected");
+    printf("all crypt(3) FFI tests passed\n");
+}

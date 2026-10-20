@@ -13,11 +13,11 @@
 //      digests). So this module carries small local helpers: auth_hex_to_bytes
 //      and explicit-length base64url encode/decode. Proposed as fin-crypto /
 //      std additions; see README and NOTES.
-//   2. crypt(3) is bound with its exact C ABI (char *crypt(const char *key,
-//      const char *salt)) and copied out via snprintf %s (variadic @define,
-//      the pattern Builder #1 verified). It is EXPERIMENTAL: on modern glibc
-//      crypt lives in libcrypt, not libc, so linking may fail — the PBKDF2
-//      path is the supported default.
+//   2. crypt(3) is NOT in this module: on modern glibc it lives in libcrypt,
+//      not libc, so an @define would break linking for every consumer of
+//      auth::fin. It lives in the opt-in companion module auth_crypt::fin
+//      (src/auth_crypt.fin), which needs -lcrypt at link time (see its
+//      header). The PBKDF2 path here is the supported default.
 //
 // STATUS: written against docs/agent-guide.md (Fin v0.4.0). UNVERIFIED — no
 // working finc binary in this environment; nothing below has been
@@ -352,50 +352,6 @@ pub fun password_verify(password: string, hash_str: string) <bool> {
     return const_time_eq(recomputed, parts.c);
 }
 
-// --- crypt(3) via C FFI (EXPERIMENTAL — see header note 2) ---
-//
-// Exact C ABI: char *crypt(const char *key, const char *salt);
-// Returns a pointer to static storage (must be copied before the next call;
-// never freed). `setting` is the full Modular Crypt Format setting, e.g.
-// "$6$saltysalt$" (SHA-512 crypt) or "$2b$12$......................".
-
-#[llvm_name="crypt"]
-@define auth_crypt(key: string, salt: string) <&char>;
-
-// snprintf for copying the static crypt buffer into Fin-owned memory.
-// (Variadic @define — the pattern Builder #1 verified through imports.)
-#[llvm_name="snprintf"]
-@define auth_snprintf(buf: &char, size: ulong, fmt: string, src: &char) <int>;
-
-#[export]
-pub struct CryptResult {
-    pub:
-        ok <bool>,
-        hash <string>,
-        err <string>,
-}
-
-#[export]
-pub fun password_hash_crypt(password: string, setting: string) <CryptResult> {
-    let fail <CryptResult> = CryptResult{ok: false, hash: "", err: ""};
-    let p <&char> = auth_crypt(password, setting);
-    if (p == null) {
-        fail.err = "password_hash_crypt: crypt(3) failed (bad setting?)";
-        return fail;
-    }
-    let buf <[char]> = new [char, 257]{};
-    let n <int> = auth_snprintf(&buf[0], cast<ulong>(256), "%s", p);
-    if (n < 0 || n > 256) {
-        delete buf;
-        fail.err = "password_hash_crypt: snprintf failed";
-        return fail;
-    }
-    buf[n] = cast<char>(0);
-    let h <string> = from_chars(buf, 0, n);
-    delete buf;
-    return CryptResult{ok: true, hash: h, err: ""};
-}
-
 // --- JWT (RFC 7519), HS256 only in v0.1.0 ---
 
 #[export]
@@ -556,18 +512,18 @@ pub fun jwt_exp(payload_json: string) <double> {
     let pr <ParseResult> = json_parse(payload_json);
     if (!pr.ok) {
         json_free_result(&pr);
-        return -1.0;
+        return cast<double>(-1.0);
     }
     // finson kind codes: 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object.
     // Kind checked before json_object_get, which blames on non-objects.
     if (pr.value.kind != 5) {
         json_free_result(&pr);
-        return -1.0;
+        return cast<double>(-1.0);
     }
     let v <&JsonValue> = json_object_get(pr.value, "exp");
     if (v == null || v.kind != 2) {
         json_free_result(&pr);
-        return -1.0;
+        return cast<double>(-1.0);
     }
     let e <double> = v.num;
     json_free_result(&pr);
@@ -577,7 +533,7 @@ pub fun jwt_exp(payload_json: string) <double> {
 #[export]
 pub fun jwt_is_expired(payload_json: string, now_unix: double) <bool> {
     let e <double> = jwt_exp(payload_json);
-    if (e < 0.0) { return true; }
+    if (e < cast<double>(0.0)) { return true; }
     return e < now_unix;
 }
 

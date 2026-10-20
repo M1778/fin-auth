@@ -5,7 +5,7 @@ envpath = ".finn"
 entrypoint = "auth.fin"
 
 [packages]
-fin-crypto = "M1778/fin-crypto@0.1.0"
+fin-crypto = "M1778/fin-crypto@0.1.1"  # 0.1.1 has the SHA-256 schedule fix (required)
 finson = "M1778/finson@0.1.0"
 
 [scripts]

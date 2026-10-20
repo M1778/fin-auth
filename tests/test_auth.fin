@@ -7,7 +7,7 @@
 // Python hmac+base64 (independent implementation), crypt(3) $6$ from Python's
 // crypt module. The crypt test only runs where libc crypt links (marked).
 
-import { auth_b64url_encode, auth_b64url_decode, auth_free_bytes, auth_pbkdf2_hex, password_hash, password_verify, password_hash_crypt, jwt_encode, jwt_decode, jwt_decode_unverified, jwt_claim, jwt_exp, jwt_is_expired, session_store_new, session_free, session_create, session_get, session_destroy, session_sweep, csrf_token, csrf_check, AuthBytes, JwtResult, JwtClaimResult, CryptResult, SessionStore } from auth::fin;
+import { auth_b64url_encode, auth_b64url_decode, auth_free_bytes, auth_pbkdf2_hex, password_hash, password_verify, jwt_encode, jwt_decode, jwt_decode_unverified, jwt_claim, jwt_exp, jwt_is_expired, session_store_new, session_free, session_create, session_get, session_destroy, session_sweep, csrf_token, csrf_check, AuthBytes, JwtResult, JwtClaimResult, SessionStore } from auth::fin;
 import { assert_true } from testing::std;
 import { equals, len, starts_with, contains } from strings::std;
 import { to_chars } from strings::std;
@@ -50,18 +50,11 @@ fun main() <noret> {
     let h2 <string> = password_hash("s3cr3t-p@ss");
     assert_true(!equals(h, h2), "salts are random");
 
-    // --- crypt(3) FFI, Python crypt module vector ---
-    // EXPERIMENTAL: needs libcrypt at link time; the assertion documents the
-    // expected value when it links.
-    let cr <CryptResult> = password_hash_crypt("password", "$6$saltysalt$");
-    if (cr.ok) {
-        assert_true(equals(cr.hash, "$6$saltysalt$gl2Dp0z9fD2n7opP4xJXmrqHVOUVPL1xc/nwGYUcLsTPSMv3wI0wU8NZwNkdtnjn8ycwtOv/t9gt.rn4H4h2b."), "crypt(3) $6$ vector");
-    } else {
-        printf("note: crypt(3) did not link here; vector not checked\n");
-    }
+    // crypt(3) lives in the opt-in auth_crypt::fin module (needs -lcrypt);
+    // see tests/test_auth_crypt.fin.
 
     // --- JWT HS256, Python-generated vector ---
-    let token <string> = "<redacted>";
+    let token <string> = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjMiLCJuYW1lIjoiRWxlYW5vciIsImlhdCI6MTc2MDk0NzIwMH0._vKAx_AXjSa63ynIrW7ETdXSYkSUz0A6E0WjgIbP6MY";
     let dec <JwtResult> = jwt_decode(token, "secret");
     assert_true(dec.ok, "jwt_decode valid token");
     assert_true(equals(dec.payload_json, "{\"sub\":\"123\",\"name\":\"Eleanor\",\"iat\":1760947200}"), "jwt payload");
@@ -93,10 +86,12 @@ fun main() <noret> {
     let cl2 <JwtClaimResult> = jwt_claim(dec.payload_json, "missing");
     assert_true(!cl2.ok, "missing claim");
     // exp handling in double space (no float->int casts: backend limit 5).
-    assert_true(jwt_exp(dec.payload_json) == 1760947200.0, "jwt_exp");
-    assert_true(jwt_is_expired(dec.payload_json, 1760947201.0), "expired after exp");
-    assert_true(!jwt_is_expired(dec.payload_json, 1760947199.0), "not expired before exp");
-    assert_true(jwt_is_expired(payload, 9999999999.0), "no exp -> treated expired");
+    // exp handling in double space (no float->int casts: backend limit 5).
+    let exp_payload <string> = "{\"sub\":\"123\",\"exp\":1760947200}";
+    assert_true(jwt_exp(exp_payload) == cast<double>(1760947200.0), "jwt_exp");
+    assert_true(jwt_is_expired(exp_payload, cast<double>(1760947201.0)), "expired after exp");
+    assert_true(!jwt_is_expired(exp_payload, cast<double>(1760947199.0)), "not expired before exp");
+    assert_true(jwt_is_expired(payload, cast<double>(9999999999.0)), "no exp -> treated expired");
 
     // --- sessions ---
     let store <&SessionStore> = session_store_new();
@@ -121,3 +116,4 @@ fun main() <noret> {
 
     printf("all fin-auth tests passed\n");
 }
+// probe append

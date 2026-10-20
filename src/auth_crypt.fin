@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: MIT
+// fin-auth companion module: crypt(3) via C FFI (EXPERIMENTAL).
+//
+// Import as `auth_crypt::fin` — kept OUT of auth::fin so the core module
+// links on stock libc. Linking this module needs -lcrypt:
+//   printf '#!/bin/sh\nexec cc "$@" -lcrypt\n' > /tmp/fincc && chmod +x /tmp/fincc
+//   FIN_CC=/tmp/fincc finc myapp.fin -I src
+//
+// STATUS: UNVERIFIED (no finc when written); the ABI is exact C:
+// char *crypt(const char *key, const char *salt).
+
+#[stdimport] %{
+import { to_chars, from_chars, equals } from strings::std;
+}%
+
+namespace fin {
+
+// --- crypt(3) via C FFI (EXPERIMENTAL — see header note 2) ---
+//
+// Exact C ABI: char *crypt(const char *key, const char *salt);
+// Returns a pointer to static storage (must be copied before the next call;
+// never freed). `setting` is the full Modular Crypt Format setting, e.g.
+// "$6$saltysalt$" (SHA-512 crypt) or "$2b$12$......................".
+
+#[llvm_name="crypt"]
+@define auth_crypt(key: string, salt: string) <&char>;
+
+// Copy the static crypt buffer into Fin-owned memory. strncpy is bound here
+// (exact C ABI: char *strncpy(char *dest, const char *src, size_t n)) because
+// std's string-typed strcpy cannot take a &char, and std already owns the
+// `snprintf` llvm_name (redeclaring it is a backend "signature mismatch").
+// NOTE: this is backend limit 9 (new, 2026-10-20): an @define whose
+// llvm_name collides with an existing std declaration fails codegen unless
+// the signatures match — import std's instead of redeclaring.
+#[llvm_name="strncpy"]
+@define auth_strncpy(dst: &char, src: &char, n: ulong) <&char>;
+
+#[export]
+pub struct CryptResult {
+    pub:
+        ok <bool>,
+        hash <string>,
+        err <string>,
+}
+
+#[export]
+pub fun password_hash_crypt(password: string, setting: string) <CryptResult> {
+    let fail <CryptResult> = CryptResult{ok: false, hash: "", err: ""};
+    let p <&char> = auth_crypt(password, setting);
+    if (p == null) {
+        fail.err = "password_hash_crypt: crypt(3) failed (bad setting?)";
+        return fail;
+    }
+    let buf <[char]> = new [char, 257]{};
+    auth_strncpy(&buf[0], p, cast<ulong>(256));
+    // strncpy NUL-pads; find the terminator by scanning our own array.
+    let n <int> = 0;
+    while (n < 256 && buf[n] != cast<char>(0)) { n = n + 1; }
+    if (n == 0) {
+        delete buf;
+        fail.err = "password_hash_crypt: crypt(3) returned an empty string";
+        return fail;
+    }
+    let h <string> = from_chars(buf, 0, n);
+    delete buf;
+    // crypt(3) signals failure with "*0" or "*1", not NULL.
+    if (equals(h, "*0") || equals(h, "*1")) {
+        fail.err = "password_hash_crypt: crypt(3) rejected the setting";
+        return fail;
+    }
+    return CryptResult{ok: true, hash: h, err: ""};
+}
+
+}
