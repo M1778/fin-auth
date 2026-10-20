@@ -56,15 +56,21 @@ jobs:
           echo "/tmp/Fin/build" >> "$GITHUB_PATH"
           /tmp/Fin/build/finc --version
 
+      - name: Fetch Fin dependencies
+        run: |
+          mkdir -p /tmp/fin-deps
+          git clone --depth 1 https://github.com/M1778/fin-crypto.git /tmp/fin-deps/fin-crypto
+          git clone --depth 1 https://github.com/M1778/finson.git /tmp/fin-deps/finson
+
       - name: Frontend check
         run: |
-          finc src/auth.fin
+          finc -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src src/auth.fin
 
       - name: Build and run tests
         run: |
-          finc tests/test_auth.fin -I src -o test_auth && ./test_auth
-          finc tests/test_auth_crypt.fin -I src -o test_auth_crypt && ./test_auth_crypt
+          finc tests/test_auth.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o test_auth && ./test_auth
+          finc tests/test_auth_crypt.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o test_auth_crypt && ./test_auth_crypt
 
       - name: Build and run example
         run: |
-          finc examples/basic.fin -I src -o example_basic && ./example_basic
+          finc examples/basic.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o example_basic && ./example_basic
