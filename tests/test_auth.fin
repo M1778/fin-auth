@@ -12,6 +12,13 @@ import { PasswordPolicy, password_policy_default, password_policy_legacy, passwo
 import { assert_true } from testing::std;
 import { equals, len, starts_with, concat, substr, free_str, repeat } from strings::std;
 import { to_chars } from strings::std;
+#c_ifdef FIN_TARGET_WINDOWS
+// No POSIX declarations/imports may reach the Windows linker. A malformed
+// record that aborts fails the whole test executable on this platform.
+fun expect_bad_record(record: string) <noret> {
+    assert_true(!password_verify("password", record), "malformed password returns false without abort");
+}
+#c_else
 import { time_clock_gettime } from time::std;
 
 // Child processes exercise abort-prone malformed inputs without hiding crashes.
@@ -30,6 +37,7 @@ fun expect_bad_record(record: string) <noret> {
     assert_true(waitpid(pid, &status, 0) == pid, "wait malformed-record probe");
     assert_true(status == 0, "malformed password returns false without abort");
 }
+#c_endif
 
 fun expect_jwt(payload: string, policy: JwtPolicy, clock: double, accepted: bool) <noret> {
     let key <string> = "0123456789abcdef0123456789abcdef";
@@ -196,7 +204,11 @@ fun hardening_tests() <noret> {
     assert_true(decoded.ok, "signature-only decoding preserved");
     free_str(decoded.payload_json); free_str(signed);
     assert_true(jwt_is_expired("{\"exp\":100}", cast<double>(100.0)), "legacy expiration equality fixed");
+#c_ifdef FIN_TARGET_WINDOWS
+    printf("hardening regressions passed (12 in-process malformed-record probes)\n");
+#c_else
     printf("hardening regressions passed (12 subprocess probes)\n");
+#c_endif
 }
 
 fun main() <noret> {
@@ -228,14 +240,24 @@ fun main() <noret> {
     assert_true(equals(auth_pbkdf2_hex("correct horse", "MDEyMzQ1Njc4OWFiY2RlZg", 10000), "4c8da0aedbd5d475b99f3dab058e2d72d96b98e8f96d9b34770f63f0d1e94517"), "pbkdf2 vector 2");
 
     // --- password_hash / password_verify round-trip ---
+#c_ifdef FIN_TARGET_WINDOWS
+    // Keep the default-cost assertion; omit only the optional POSIX benchmark.
+    let default_hash <string> = password_hash("default-cost-probe");
+#c_else
+#c_ifdef FIN_TARGET_DARWIN
+    #cdef AUTH_MONOTONIC_CLOCK 6
+#c_else
+    #cdef AUTH_MONOTONIC_CLOCK 1
+#c_endif
     let started <[long]> = new [long, 2]{};
     let stopped <[long]> = new [long, 2]{};
-    assert_true(time_clock_gettime(1, &started[0]) == 0, "default hash benchmark clock");
+    assert_true(time_clock_gettime(AUTH_MONOTONIC_CLOCK, &started[0]) == 0, "default hash benchmark clock");
     let default_hash <string> = password_hash("default-cost-probe");
-    assert_true(time_clock_gettime(1, &stopped[0]) == 0, "default hash benchmark end");
+    assert_true(time_clock_gettime(AUTH_MONOTONIC_CLOCK, &stopped[0]) == 0, "default hash benchmark end");
     let elapsed <double> = cast<double>(stopped[0] - started[0]) + cast<double>(stopped[1] - started[1]) / cast<double>(1000000000.0);
     printf("default PBKDF2 600000 hash seconds: %.6f\n", elapsed);
     delete started; delete stopped;
+#c_endif
     assert_true(starts_with(default_hash, "$pbkdf2-sha256$600000$"), "default cost emitted");
     assert_true(!password_needs_rehash(default_hash, password_policy_default()), "default hash needs no upgrade");
     free_str(default_hash);

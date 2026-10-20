@@ -18,18 +18,18 @@ production recommendation. `jwt_decode` checks only signature/header; use
 
 ## Installation and coordinated dependencies
 
-This working tree is **unreleased** and requires the coordinated sibling sources:
+This source revision requires coordinated dependencies pinned by full Git commit
+in `finn.toml`:
 
-- `fin-crypto`: `hmac_sha256_bytes` returning exactly 32 owned bytes.
-- `finson`: `json_parse_strict` with duplicate-key rejection, input budgets,
-  finite-number handling, UTF-8 validation, and embedded-NUL rejection.
-- Frozen Fin standard library: `strings`, `time`, `collection`.
+- `fin-crypto@777990f2ef19ec7be6a69a628957ffb48da11974`: raw HMAC and native Windows RNG.
+- `finson@3ec90fe94643404c06349ceb6fcc004ad89ca5c3`: strict JSON, duplicate-key
+  rejection, input budgets, finite numbers, UTF-8 and embedded-NUL validation.
+- Fin standard library: `strings`, `time`, `collection`.
 
-The existing `finn.toml` pins (`fin-crypto@0.1.1`, `finson@0.1.0`) describe the old
-release and **do not provide these new APIs**. They are intentionally not replaced
-with invented tags. Publishing compatible dependency versions and then updating
-those pins is a release blocker. Installing `fin-auth@0.1.0` does not install this
-hardening work. For now build directly against the sibling checkouts (below).
+These are existing pushed commits, not invented release tags. Finn accepts Git
+revisions and the manifest pins the APIs used here. Installing the older
+`fin-auth@0.1.0` tag does not install this hardening work; use the current source
+revision. A tagged release remains separate from these source commits.
 
 ### Implementation notes
 
@@ -156,14 +156,27 @@ ROOT=/home/M1778/fin-projects
 "$ROOT/fin-auth/test_auth"
 ```
 
-The malformed-input subprocess probes use POSIX `fork`, `waitpid`, and `_exit`.
-They are test-only, not dependencies of the library API. Run the crypt test by
-compiling `tests/test_auth_crypt.fin` with `-c -o test_auth_crypt.o`, then linking
-with `cc test_auth_crypt.o -lcrypt -lm -o test_auth_crypt.exe`.
+The malformed-input probes retain POSIX `fork`, `waitpid`, and `_exit` on Linux
+and macOS. `FIN_TARGET_WINDOWS` instead validates all 12 malformed records
+in-process: a regression that aborts fails the test executable. POSIX declarations
+and the `clock_gettime` import are excluded from that Windows branch. The optional
+hash benchmark uses Linux/macOS monotonic clock IDs; Windows skips timing but
+still hashes and verifies the emitted 600,000-iteration policy metadata.
+
+Native Windows and macOS build/run validation is **pending CI**; Linux O0/O2
+results above do not establish native compatibility. Windows also requires the
+coordinated fin-crypto Windows RNG implementation. No CI result is claimed here.
+
+`auth_crypt::fin` is a separate optional POSIX/libcrypt module, never imported by
+`auth::fin` or the core test suite. Windows users must not build its optional test
+or link libcrypt. On supported POSIX hosts, run the crypt test by compiling
+`tests/test_auth_crypt.fin` with `-c -o test_auth_crypt.o`, then linking with
+`cc test_auth_crypt.o -lcrypt -lm -o test_auth_crypt.exe`. Platform crypt algorithm
+availability can differ; the supplied SHA-512-crypt vector is validated on Linux.
 
 ## Remaining limitations
 
-- Coordinated dependency releases and manifest updates are still required.
+- Tagged releases remain separate; source dependencies are pinned to pushed commits.
 - JWT: HS256 and one exact header only; no key rotation/JWKS or replay store.
 - The explicitly named legacy password policy remains 10,000 iterations and is
   not appropriate for new production hashes. The default is 600,000; deployment

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Authentication & sessions for Fin (coordinated unreleased hardening).
 //
-// Primitives come from fin-crypto's raw HMAC API; strict JWT JSON parsing comes
-// from finson. These APIs require the coordinated sibling source checkouts,
-// not the old dependency tags in finn.toml. See README for build commands.
+// Raw HMAC and strict JWT parsing use the immutable dependency revisions in finn.toml.
 //
 // crypt(3) stays in the opt-in auth_crypt::fin module, linked with -lcrypt.
 // Tested with frozen finc 0.4.0 contract 3 at -O0 and -O2. Parallel collections
