@@ -69,7 +69,8 @@ jobs:
       - name: Build and run tests
         run: |
           finc tests/test_auth.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o test_auth && ./test_auth
-          finc tests/test_auth_crypt.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o test_auth_crypt && ./test_auth_crypt
+          printf '#!/bin/sh\nexec cc "$@" -lcrypt\n' > /tmp/fincc && chmod +x /tmp/fincc
+          FIN_CC=/tmp/fincc finc tests/test_auth_crypt.fin -I src -I /tmp/fin-deps/fin-crypto/src -I /tmp/fin-deps/finson/src -o test_auth_crypt && ./test_auth_crypt
 
       - name: Build and run example
         run: |
