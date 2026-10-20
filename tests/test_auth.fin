@@ -8,11 +8,199 @@
 // crypt module. The crypt test only runs where libc crypt links (marked).
 
 import { auth_b64url_encode, auth_b64url_decode, auth_free_bytes, auth_pbkdf2_hex, password_hash, password_verify, jwt_encode, jwt_decode, jwt_decode_unverified, jwt_claim, jwt_exp, jwt_is_expired, session_store_new, session_free, session_create, session_get, session_destroy, session_sweep, csrf_token, csrf_check, AuthBytes, JwtResult, JwtClaimResult, SessionStore } from auth::fin;
+import { PasswordPolicy, password_policy_default, password_policy_legacy, password_hash_with_policy, password_verify_with_policy, password_needs_rehash, JwtPolicy, jwt_verify, session_create_at, session_get_at, session_sweep_at } from auth::fin;
 import { assert_true } from testing::std;
-import { equals, len, starts_with, contains } from strings::std;
+import { equals, len, starts_with, concat, substr, free_str, repeat } from strings::std;
 import { to_chars } from strings::std;
+import { time_clock_gettime } from time::std;
+
+// Child processes exercise abort-prone malformed inputs without hiding crashes.
+@define fork() <int>;
+@define waitpid(pid: int, status: &int, options: int) <int>;
+@define _exit(status: int) <noret>;
+
+fun expect_bad_record(record: string) <noret> {
+    let pid <int> = fork();
+    assert_true(pid >= 0, "fork malformed-record probe");
+    if (pid == 0) {
+        if (password_verify("password", record)) { _exit(1); }
+        _exit(0);
+    }
+    let status <int> = -1;
+    assert_true(waitpid(pid, &status, 0) == pid, "wait malformed-record probe");
+    assert_true(status == 0, "malformed password returns false without abort");
+}
+
+fun expect_jwt(payload: string, policy: JwtPolicy, clock: double, accepted: bool) <noret> {
+    let key <string> = "0123456789abcdef0123456789abcdef";
+    let token <string> = jwt_encode(payload, key);
+    let result <JwtResult> = jwt_verify(token, key, policy, clock);
+    assert_true(result.ok == accepted, payload);
+    if (result.ok) { free_str(result.payload_json); }
+    free_str(token);
+}
+
+fun hardening_tests() <noret> {
+    let malformed <[string]> = ["A", "AAAAA", "Zh", "Zm9", "Zg=", "Zg==", "Z g", "+w", "/w", "!!"];
+    foreach (text <string> in malformed) {
+        let decoded <AuthBytes> = auth_b64url_decode(text);
+        assert_true(decoded.len == -1, "strict base64url rejection");
+        auth_free_bytes(&decoded);
+    }
+    delete malformed;
+    let valid <[string]> = ["", "Zg", "Zm8", "Zm9v", "_w", "__8"];
+    foreach (text <string> in valid) {
+        let decoded <AuthBytes> = auth_b64url_decode(text);
+        assert_true(decoded.len >= 0, "canonical base64url accepted");
+        let encoded <string> = auth_b64url_encode(decoded.data, decoded.len);
+        assert_true(equals(encoded, text), "canonical base64url stable");
+        free_str(encoded);
+        auth_free_bytes(&decoded);
+    }
+    delete valid;
+    let small <[char]> = new [char, 1]{};
+    let beyond <string> = auth_b64url_encode(small, 2);
+    let negative <string> = auth_b64url_encode(small, -1);
+    let enormous <string> = auth_b64url_encode(small, 2147483647);
+    assert_true(equals(beyond, ""), "encoder bounds recoverable");
+    assert_true(equals(negative, ""), "encoder negative length recoverable");
+    assert_true(equals(enormous, ""), "encoder integer overflow prevented");
+    free_str(beyond); free_str(negative); free_str(enormous);
+    delete small;
+
+    let policy <PasswordPolicy> = PasswordPolicy{hash_iterations: 3, min_verify_iterations: 1, max_verify_iterations: 5};
+    let record <string> = "$pbkdf2-sha256$2$MDEyMzQ1Njc4OWFiY2RlZg$RTZCeRbsxNsX_5cC2qwamnVfsX-aVE68Tp3EzhaJES4";
+    assert_true(password_verify_with_policy("password", record, policy), "independent PBKDF2 record");
+    assert_true(!password_verify_with_policy("wrong", record, policy), "policy wrong password");
+    assert_true(password_needs_rehash(record, policy), "legacy cost needs upgrade");
+    let upgraded <string> = password_hash_with_policy("password", policy);
+    assert_true(starts_with(upgraded, "$pbkdf2-sha256$3$"), "configured hashing cost serialized");
+    assert_true(password_verify_with_policy("password", upgraded, policy), "upgraded record verifies");
+    assert_true(!password_needs_rehash(upgraded, policy), "current cost needs no upgrade");
+    let lower <PasswordPolicy> = PasswordPolicy{hash_iterations: 1, min_verify_iterations: 1, max_verify_iterations: 5};
+    assert_true(!password_needs_rehash(record, lower), "never downgrade stronger hash");
+    let strict <PasswordPolicy> = PasswordPolicy{hash_iterations: 3, min_verify_iterations: 3, max_verify_iterations: 5};
+    assert_true(!password_verify_with_policy("password", record, strict), "minimum cost enforced");
+    let limited <PasswordPolicy> = PasswordPolicy{hash_iterations: 1, min_verify_iterations: 1, max_verify_iterations: 1};
+    assert_true(!password_verify_with_policy("password", record, limited), "maximum cost enforced");
+    let invalid <PasswordPolicy> = PasswordPolicy{hash_iterations: 0, min_verify_iterations: 1, max_verify_iterations: 5};
+    assert_true(equals(password_hash_with_policy("password", invalid), ""), "invalid hash policy recoverable");
+    assert_true(!password_verify_with_policy("password", record, invalid), "invalid verify policy rejected");
+    let oversized_password <string> = repeat("p", 4097);
+    assert_true(equals(password_hash_with_policy(oversized_password, policy), ""), "oversized password hash rejected");
+    assert_true(!password_verify_with_policy(oversized_password, record, policy), "oversized password verify rejected");
+    free_str(oversized_password);
+    let oversized_record <string> = repeat("x", 97);
+    assert_true(!password_verify("password", oversized_record), "oversized record rejected");
+    free_str(oversized_record);
+    assert_true(password_needs_rehash("malformed", policy), "malformed record requires replacement");
+    let bad_records <[string]> = [
+        "$pbkdf2-sha256$$salt$hash", "$pbkdf2-sha256$x$salt$hash",
+        "$pbkdf2-sha256$2147483648$salt$hash", "$pbkdf2-sha256$+$salt$hash",
+        "$pbkdf2-sha256$-1$salt$hash", "$pbkdf2-sha256$01$salt$hash",
+        "$pbkdf2-sha256$1000001$MDEyMzQ1Njc4OWFiY2RlZg$RTZCeRbsxNsX_5cC2qwamnVfsX-aVE68Tp3EzhaJES4",
+        "$pbkdf2-sha256$2$MDEyMzQ1Njc4OWFiY2RlZh$RTZCeRbsxNsX_5cC2qwamnVfsX-aVE68Tp3EzhaJES4",
+        "$pbkdf2-sha256$2$MDEyMzQ1Njc4OWFiY2RlZg$RTZCeRbsxNsX_5cC2qwamnVfsX-aVE68Tp3EzhaJES5",
+        "$pbkdf2-sha256$2$MDEyMzQ1Njc4OWFiY2RlZg$!TZCeRbsxNsX_5cC2qwamnVfsX-aVE68Tp3EzhaJES4",
+        "$pbkdf2-sha256$2$MDEyMzQ1Njc4OWFiY2RlZg$", "$pbkdf2-sha256$2$a$b$c"
+    ];
+    foreach (bad_record <string> in bad_records) { expect_bad_record(bad_record); }
+    delete bad_records;
+    for (let i <int> = 0; i < 20; i++) {
+        assert_true(password_verify_with_policy("password", record, policy), "repeated password verification");
+    }
+    free_str(upgraded);
+
+    let store <&SessionStore> = session_store_new();
+    let t1 <string> = session_create_at(store, "u1", 10, 100);
+    let t2 <string> = session_create_at(store, "u2", 20, 100);
+    let t3 <string> = session_create_at(store, "u3", 10, 100);
+    let cookie <string> = concat("session=", t1);
+    let parsed <string> = substr(cookie, 8, 64);
+    assert_true(equals(session_get_at(store, parsed, 109), "u1"), "serialized cookie token lookup");
+    assert_true(equals(session_get_at(store, parsed, 110), ""), "deadline expires exactly");
+    assert_true(session_destroy(store, parsed), "serialized cookie token logout");
+    assert_true(equals(session_get_at(store, t3, 109), "u3"), "swap removal preserves alignment");
+    assert_true(session_sweep_at(store, 110) == 1, "deterministic sweep removes exact deadline");
+    assert_true(equals(session_get_at(store, t2, 119), "u2"), "sweep keeps survivor");
+    assert_true(session_sweep_at(store, 120) == 1, "sweep removes last session");
+    assert_true(session_sweep_at(store, 120) == 0, "sweep idempotent");
+    assert_true(equals(session_create_at(store, "u", 0, 100), ""), "zero TTL rejected");
+    assert_true(equals(session_create_at(store, "u", 10, cast<long>(9223372036854775807)), ""), "TTL overflow rejected");
+    session_free(store);
+    free_str(cookie); free_str(parsed); free_str(t1); free_str(t2); free_str(t3);
+
+    let jp <JwtPolicy> = JwtPolicy{issuer: "issuer", audience: "api", clock_skew_secs: cast<double>(0.0)};
+    let js <string> = "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200,\"nbf\":100}";
+    expect_jwt(js, jp, cast<double>(100.0), true);
+    expect_jwt(js, jp, cast<double>(199.0), true);
+    expect_jwt(js, jp, cast<double>(200.0), false);
+    expect_jwt(js, jp, cast<double>(99.0), false);
+    let skew <JwtPolicy> = JwtPolicy{issuer: "issuer", audience: "api", clock_skew_secs: cast<double>(5.0)};
+    expect_jwt(js, skew, cast<double>(95.0), true);
+    expect_jwt(js, skew, cast<double>(94.0), false);
+    expect_jwt(js, skew, cast<double>(204.0), true);
+    expect_jwt(js, skew, cast<double>(205.0), false);
+    expect_jwt("{\"iss\":\"issuer\",\"aud\":[\"other\",\"api\"],\"exp\":200}", jp, cast<double>(100.0), true);
+    let bad_claims <[string]> = [
+        "[]", "null", "not json", "{}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":\"200\"}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200,\"nbf\":\"100\"}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200,\"nbf\":200}",
+        "{\"iss\":\"wrong\",\"aud\":\"api\",\"exp\":200}",
+        "{\"iss\":\"issuer\",\"aud\":\"wrong\",\"exp\":200}",
+        "{\"iss\":\"issuer\",\"aud\":[\"api\",1],\"exp\":200}",
+        "{\"iss\":\"issuer\",\"aud\":[],\"exp\":200}",
+        "{\"aud\":\"api\",\"exp\":200}", "{\"iss\":\"issuer\",\"exp\":200}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":-1}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":1e309}",
+        "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200,\"exp\":300}",
+        "{\"iss\":\"wrong\",\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200}",
+        "{\"iss\":\"issuer\",\"aud\":\"wrong\",\"aud\":\"api\",\"exp\":200}",
+        "{\"iss\":\"issuer\\u0000evil\",\"aud\":\"api\",\"exp\":200}"
+    ];
+    foreach (claims <string> in bad_claims) { expect_jwt(claims, jp, cast<double>(100.0), false); }
+    delete bad_claims;
+    let key <string> = "0123456789abcdef0123456789abcdef";
+    // Independently signed with Python hmac+base64: raw NUL, invalid UTF-8,
+    // impossible base64 length and nonzero unused bits. All signatures are valid.
+    let malformed_tokens <[string]> = [
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJpc3N1ZXIiLCJhdWQiOiJhcGkiLCJleHAiOjIwMH0AanVuaw.ZuhQa8fwtjIq_VGnWnACqKS7Efh7Bi_6VSxZ9LpqKGM",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiL_IiwiYXVkIjoiYXBpIiwiZXhwIjoyMDB9.9mgFk0utsiVRljJIHw-1e_7CqgQlexYiEzXYqxWH_Uc",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.A.kB-5O5B-OY1kerb9uyGALkYaseeaGEw3Ta1NcgUBXng",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.Zh.BiUT3aQxGMaYcRpXuCxH2bi7AaXZcUpV3j7yfyBu-qk"
+    ];
+    foreach (malformed_token <string> in malformed_tokens) {
+        assert_true(!jwt_verify(malformed_token, key, jp, cast<double>(100.0)).ok, "signed malformed payload rejected");
+    }
+    assert_true(!jwt_decode_unverified(malformed_tokens[0]).ok, "inspection rejects raw NUL");
+    assert_true(!jwt_decode_unverified(malformed_tokens[2]).ok, "inspection rejects impossible encoding");
+    delete malformed_tokens;
+    let signed <string> = jwt_encode(js, key);
+    assert_true(!jwt_verify(signed, "wrongwrongwrongwrongwrongwrongwrong", jp, cast<double>(100.0)).ok, "policy checks signature");
+    assert_true(!jwt_verify(signed, "short", jp, cast<double>(100.0)).ok, "policy rejects short key");
+    assert_true(!jwt_verify(signed, key, jp, cast<double>(-1.0)).ok, "negative clock rejected");
+    let bad_skew <JwtPolicy> = JwtPolicy{issuer: "issuer", audience: "api", clock_skew_secs: cast<double>(-1.0)};
+    assert_true(!jwt_verify(signed, key, bad_skew, cast<double>(100.0)).ok, "negative skew rejected");
+    let missing_issuer <JwtPolicy> = JwtPolicy{issuer: "", audience: "api", clock_skew_secs: cast<double>(0.0)};
+    assert_true(!jwt_verify(signed, key, missing_issuer, cast<double>(100.0)).ok, "issuer policy cannot be disabled");
+    let oversized_token <string> = repeat("a", 65537);
+    assert_true(!jwt_verify(oversized_token, key, jp, cast<double>(100.0)).ok, "oversized compact token rejected");
+    assert_true(!jwt_decode_unverified(oversized_token).ok, "oversized inspection token rejected");
+    free_str(oversized_token);
+    let invalid_time <double> = cast<double>(0.0) / cast<double>(0.0);
+    assert_true(!jwt_verify(signed, key, jp, invalid_time).ok, "NaN clock rejected");
+    let nan_skew <JwtPolicy> = JwtPolicy{issuer: "issuer", audience: "api", clock_skew_secs: invalid_time};
+    assert_true(!jwt_verify(signed, key, nan_skew, cast<double>(100.0)).ok, "NaN skew rejected");
+    let decoded <JwtResult> = jwt_decode(signed, key);
+    assert_true(decoded.ok, "signature-only decoding preserved");
+    free_str(decoded.payload_json); free_str(signed);
+    assert_true(jwt_is_expired("{\"exp\":100}", cast<double>(100.0)), "legacy expiration equality fixed");
+    printf("hardening regressions passed (12 subprocess probes)\n");
+}
 
 fun main() <noret> {
+    hardening_tests();
     // --- base64url ---
     let foobar <[char]> = to_chars("foobar");
     assert_true(equals(auth_b64url_encode(foobar, 6), "Zm9vYmFy"), "b64url('foobar')");
@@ -40,14 +228,26 @@ fun main() <noret> {
     assert_true(equals(auth_pbkdf2_hex("correct horse", "MDEyMzQ1Njc4OWFiY2RlZg", 10000), "4c8da0aedbd5d475b99f3dab058e2d72d96b98e8f96d9b34770f63f0d1e94517"), "pbkdf2 vector 2");
 
     // --- password_hash / password_verify round-trip ---
-    let h <string> = password_hash("s3cr3t-p@ss");
-    assert_true(starts_with(h, "$pbkdf2-sha256$10000$"), "hash format prefix");
+    let started <[long]> = new [long, 2]{};
+    let stopped <[long]> = new [long, 2]{};
+    assert_true(time_clock_gettime(1, &started[0]) == 0, "default hash benchmark clock");
+    let default_hash <string> = password_hash("default-cost-probe");
+    assert_true(time_clock_gettime(1, &stopped[0]) == 0, "default hash benchmark end");
+    let elapsed <double> = cast<double>(stopped[0] - started[0]) + cast<double>(stopped[1] - started[1]) / cast<double>(1000000000.0);
+    printf("default PBKDF2 600000 hash seconds: %.6f\n", elapsed);
+    delete started; delete stopped;
+    assert_true(starts_with(default_hash, "$pbkdf2-sha256$600000$"), "default cost emitted");
+    assert_true(!password_needs_rehash(default_hash, password_policy_default()), "default hash needs no upgrade");
+    free_str(default_hash);
+    let h <string> = password_hash_with_policy("s3cr3t-p@ss", password_policy_legacy());
+    assert_true(starts_with(h, "$pbkdf2-sha256$10000$"), "legacy hash format prefix");
+    assert_true(password_needs_rehash(h, password_policy_default()), "legacy hash migrates to default cost");
     assert_true(password_verify("s3cr3t-p@ss", h), "correct password verifies");
     assert_true(!password_verify("s3cr3t-p@ss!", h), "wrong password rejected");
     assert_true(!password_verify("s3cr3t-p@ss", "$pbkdf2-sha256$10000$broken"), "malformed hash rejected");
     assert_true(!password_verify("s3cr3t-p@ss", "not-a-hash"), "garbage rejected");
     // Salts differ between hashes.
-    let h2 <string> = password_hash("s3cr3t-p@ss");
+    let h2 <string> = password_hash_with_policy("s3cr3t-p@ss", password_policy_legacy());
     assert_true(!equals(h, h2), "salts are random");
 
     // crypt(3) lives in the opt-in auth_crypt::fin module (needs -lcrypt);
@@ -113,6 +313,22 @@ fun main() <noret> {
     assert_true(len(c1) == 64, "csrf token length");
     assert_true(csrf_check(c1, c1), "csrf self-check");
     assert_true(!csrf_check(c1, c2), "csrf mismatch");
+    assert_true(!csrf_check("", ""), "absent CSRF tokens rejected");
+    assert_true(!csrf_check("a", "a"), "short equal CSRF tokens rejected");
+    let valid_csrf <string> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let other_csrf <string> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee";
+    let nonhex_csrf <string> = "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let uppercase_csrf <string> = "A123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert_true(csrf_check(valid_csrf, valid_csrf), "equal canonical CSRF tokens accepted");
+    assert_true(!csrf_check(valid_csrf, other_csrf), "different canonical CSRF tokens rejected");
+    assert_true(!csrf_check(nonhex_csrf, nonhex_csrf), "equal nonhex CSRF tokens rejected");
+    assert_true(!csrf_check(uppercase_csrf, uppercase_csrf), "noncanonical uppercase CSRF rejected");
+    assert_true(!csrf_check("", valid_csrf), "absent submitted CSRF rejected");
+    assert_true(!csrf_check(valid_csrf, ""), "absent expected CSRF rejected");
+    let absent_csrf <[string]> = new [string, 1]{};
+    assert_true(!csrf_check(absent_csrf[0], valid_csrf), "null submitted CSRF rejected");
+    assert_true(!csrf_check(valid_csrf, absent_csrf[0]), "null expected CSRF rejected");
+    delete absent_csrf;
 
     printf("all fin-auth tests passed\n");
 }

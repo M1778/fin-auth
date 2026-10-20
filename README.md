@@ -9,46 +9,36 @@ The crypto-primitive/application-layer split is kept clean: every primitive
 application layer on top. JSON comes from
 [`finson`](https://github.com/M1778/finson).
 
-```fin
-import { password_hash, password_verify, jwt_encode, jwt_decode } from auth::fin;
+The convenience `password_hash` function now uses **600,000 PBKDF2-HMAC-SHA256
+iterations** via `password_policy_default()`. Verification accepts bounded older
+records for migration; `password_needs_rehash` identifies upgrades. The explicitly
+named legacy policy retains 10,000 iterations for compatibility, not as a
+production recommendation. `jwt_decode` checks only signature/header; use
+`jwt_verify` to enforce claims.
 
-let hash = password_hash("correct-horse-battery-staple"); // store this
-if (password_verify(candidate, hash)) {
-    let token = jwt_encode("{\"sub\":\"user-42\"}", "server-secret");
-}
-```
+## Installation and coordinated dependencies
 
-## Installation
+This working tree is **unreleased** and requires the coordinated sibling sources:
 
-With [finn](https://github.com/M1778/finn) (manifest: `finn.toml`):
+- `fin-crypto`: `hmac_sha256_bytes` returning exactly 32 owned bytes.
+- `finson`: `json_parse_strict` with duplicate-key rejection, input budgets,
+  finite-number handling, UTF-8 validation, and embedded-NUL rejection.
+- Frozen Fin standard library: `strings`, `time`, `collection`.
 
-```toml
-[packages]
-fin-auth = "M1778/fin-auth@0.1.0"
-```
+The existing `finn.toml` pins (`fin-crypto@0.1.1`, `finson@0.1.0`) describe the old
+release and **do not provide these new APIs**. They are intentionally not replaced
+with invented tags. Publishing compatible dependency versions and then updating
+those pins is a release blocker. Installing `fin-auth@0.1.0` does not install this
+hardening work. For now build directly against the sibling checkouts (below).
 
-Then `import { ... } from auth::fin;`.
+### Implementation notes
 
-## Dependencies
-
-- [`M1778/fin-crypto@0.1.1`](https://github.com/M1778/fin-crypto) — HMAC-SHA256,
-  `random_bytes` / `random_hex`, `const_time_eq`.
-- [`M1778/finson@0.1.0`](https://github.com/M1778/finson) — claim extraction
-  from JWT payloads.
-- Fin std: `bits`, `strings`, `time`, `collection`.
-
-### Documented implementation notes
-
-1. **Hex/base64url helpers are local, not duplicated crypto.** `fin-crypto`
-   v0.1.0 returns HMAC as hex strings only (no raw-bytes API), and std
-   `base64_encode` is `strlen`-limited (cannot encode binary). This module
-   therefore carries `auth_hex_to_bytes` and explicit-length
-   `auth_b64url_encode`/`auth_b64url_decode`. Proposed as fin-crypto/std
-   additions; no cryptographic primitive is reimplemented.
-2. **`crypt(3)` is experimental.** Bound with its exact C ABI
-   (`char *crypt(const char *key, const char *salt)`), buffer copied via
-   `snprintf` `%s`. On modern glibc `crypt` lives in `libcrypt`, not `libc`,
-   so linking may fail — the PBKDF2 path is the supported default.
+PBKDF2 uses raw HMAC bytes and native integer XOR; the allocating hex roundtrip
+and data-dependent arithmetic XOR helper have been removed.
+Explicit-length base64url helpers remain local because the standard string-based
+encoder cannot encode binary digests. `crypt(3)` remains experimental and opt-in
+through `auth_crypt::fin`, with `strncpy` copying its static result and `-lcrypt`
+required on modern glibc.
 
 ## API reference
 
@@ -56,17 +46,34 @@ Then `import { ... } from auth::fin;`.
 
 | Function | Description |
 |---|---|
-| `password_hash(password: string) <string>` | PBKDF2-HMAC-SHA256, 10k iterations, random 16-byte salt; `$pbkdf2-sha256$<iter>$<salt>$<hash>` |
-| `password_verify(password, hash_str) <bool>` | Constant-time verify; false on malformed input |
+| `password_hash(password: string) <string>` | Default 600k iterations, random 16-byte salt; `$pbkdf2-sha256$<iter>$<salt>$<hash>` |
+| `password_verify(password, hash_str) <bool>` | Default verification bounds; false on malformed records without aborting |
+| `password_hash_with_policy(password, policy) <string>` | Configurable PBKDF2 cost; empty literal on invalid input/policy |
+| `password_verify_with_policy(password, hash_str, policy) <bool>` | Validate full record and work bounds before deriving |
+| `password_needs_rehash(hash_str, policy) <bool>` | True for malformed/unsupported records or cost below target; never requests downgrade |
+| `password_policy_default() <PasswordPolicy>` | Hash=600,000; verification minimum=1, maximum=1,000,000 |
+| `password_policy_legacy() <PasswordPolicy>` | Explicit legacy hash=10,000; verification minimum=1, maximum=1,000,000 |
 | `auth_pbkdf2_hex(password, salt_b64, iterations) <string>` | Raw PBKDF2 diagnostic (interop testing) |
 | `password_hash_crypt(password, setting) <CryptResult>` | **Experimental** `crypt(3)` FFI (e.g. `$6$` SHA-512 crypt) |
+
+`PasswordPolicy` fields are `hash_iterations`, `min_verify_iterations`, and
+`max_verify_iterations` (all `int`). Require `1 <= min <= hash <= max <= 1,000,000`.
+Benchmark a suitable target and maximum on deployment hardware; the ceiling is
+not a security recommendation or a substitute for login rate limiting. Passwords
+are limited to 4,096 bytes; records to 96 bytes, with canonical positive decimal
+iterations, exactly 16 salt bytes and 32 digest bytes. Whole-record validation
+precedes all KDF work. After a **successful** verification, use `needs_rehash`
+to migrate accepted older hashes. Setting a higher verification minimum rejects
+older hashes instead of migrating them. Hash/diagnostic strings are caller-owned
+on success (`free_str`); failure empty literals must not be freed.
 
 ### JWT (HS256)
 
 | Function | Description |
 |---|---|
 | `jwt_encode(payload_json, secret) <string>` | Compact JWT with fixed `{"alg":"HS256","typ":"JWT"}` header |
-| `jwt_decode(token, secret) <JwtResult>` | Verify signature (constant-time) + header `alg`; returns payload JSON |
+| `jwt_decode(token, secret) <JwtResult>` | Signature/header check only; does not validate JSON, expiration, issuer, or audience |
+| `jwt_verify(token, secret, policy: JwtPolicy, now_unix: double) <JwtResult>` | Signature plus strict object payload, required numeric `exp`, optional numeric `nbf`, required issuer/audience |
 | `jwt_decode_unverified(token) <JwtResult>` | Parse without verifying — inspection only, never trust |
 | `jwt_claim(payload_json, name) <JwtClaimResult>` | One claim, stringified via finson |
 | `jwt_exp(payload_json) <double>` | Numeric `exp`, or -1 |
@@ -74,6 +81,28 @@ Then `import { ... } from auth::fin;`.
 
 `jwt_decode` rejects `alg=none` and any non-HS256 header by comparing the
 header segment against the fixed expected value (no algorithm confusion).
+Semantically equivalent reordered headers remain unsupported intentionally.
+
+`JwtPolicy` contains nonempty `issuer: string`, `audience: string`, and
+`clock_skew_secs: double` in `[0, 300]`. `jwt_verify` requires a 32–4,096 byte
+shared key (length does not guarantee entropy). Use a cryptographically random
+key. It rejects duplicate claims, invalid JSON/UTF-8/NUL, missing/wrong-type
+claims, mismatched issuer/audience, and nonfinite/out-of-range timestamps.
+Audience may be a matching string or an all-string array containing it.
+Dates/clock must lie in `[0, 2^53-1]`; fractional NumericDates are accepted.
+Expiration rejects `now - skew >= exp`; not-before rejects `now + skew < nbf`.
+A present `nbf` must precede `exp`. Compact inputs are limited to 65,536 bytes.
+Success `payload_json` is caller-owned (`free_str`); failure fields are literals.
+
+### Base64url
+
+`auth_b64url_decode` requires the URL-safe alphabet, no padding, a possible
+encoded length, and zero unused trailing bits. Its owned buffer must be freed
+with `auth_free_bytes` on success **and failure** (`len == -1`). Decoding is
+capped at 16,777,216 input characters. `auth_b64url_encode` accepts explicit
+lengths up to 12,582,912 bytes and no greater than `data.length`; invalid bounds
+return an allocated empty string without reading the buffer. Every encoder
+result is caller-owned (`free_str`), including empty input and invalid bounds.
 
 ### Sessions
 
@@ -84,34 +113,68 @@ header segment against the fixed expected value (no algorithm confusion).
 | `session_get(store, token) <string>` | user_id, or `""` when unknown/expired |
 | `session_destroy(store, token) <bool>` | Invalidate |
 | `session_sweep(store) <int>` | Drop expired; returns count removed |
+| `session_create_at(store, user_id, ttl_secs, now_unix)` | Explicit-clock creation; invalid TTL/overflow returns empty literal |
+| `session_get_at(store, token, now_unix)` | Explicit-clock lookup; expires at `now >= deadline` |
+| `session_sweep_at(store, now_unix)` | Deterministic expiration sweep |
+
+Clock arguments are `long` Unix seconds. Existing wrappers call the real clock.
+Lookup/logout compare token bytes, so tokens reconstructed from cookies work.
+The current store borrows both token/user strings: callers must keep them alive
+while stored and free generated token strings after removal/free. The legacy
+`Collection` backing buffers have no disposal API in the frozen stdlib;
+`session_free` cannot reclaim those internal buffers. This remains a limitation,
+not a leak-free production store.
 
 ### CSRF
 
 `csrf_token() <string>` — 64 hex chars from the CSPRNG.
-`csrf_check(a, b) <bool>` — constant-time comparison.
+`csrf_check(a, b) <bool>` — requires two canonical 64-character lowercase-hex
+tokens before constant-time comparison; absent, empty, short, or malformed
+values are rejected, even when both inputs are equal.
 
 ## Verification status
 
-**VERIFIED 2026-10-20** — built and executed with finc 0.4.0 (contract 3).
-`tests/test_auth.fin` passes: base64url round-trips, two PBKDF2-HMAC-SHA256
-vectors from Python `hashlib.pbkdf2_hmac`, password hash/verify round-trips,
-a Python-generated JWT HS256 vector plus tamper/`alg=none`/malformed
-rejections, claim/`exp` handling, and the session store lifecycle.
-`tests/test_auth_crypt.fin` passes with `-lcrypt` (FIN_CC wrapper): the
-`crypt(3)` `$6$` vector matches Python's `crypt` module, and bad settings
-are rejected via crypt's `*0`/`*1` convention. `examples/basic.fin` runs
-end-to-end (register → login → JWT → session → CSRF).
+**VERIFIED 2026-10-21** — frozen finc 0.4.0 (contract 3), sibling coordinated
+sources, Linux. Existing and hardening tests pass at `-O0` and `-O2`, including
+12 malformed-record child processes that must exit normally with false results,
+independent PBKDF2 vectors, cost/migration policy, canonical base64url, serialized
+cookie lookup/logout, deadline sweeps, strict JWT claims/duplicates and skew.
+One 600,000-iteration default hash measured **0.580 seconds at -O2** and
+**8.323 seconds at -O0** on this environment (monotonic-clock timing around
+hashing only). These are observations, not deployment latency guarantees.
+The suite hashes once with the default and otherwise uses explicit lower-cost
+policies/vectors. Existing optional `crypt(3)` tests and the example also run successfully.
 
+Reproduce from these checkouts (Bash; repeat with `-O2`):
 
-## Known limitations (v0.1.0)
+```bash
+ROOT=/home/M1778/fin-projects
+"$ROOT/.toolchain/bin/finc" "$ROOT/fin-auth/tests/test_auth.fin" \
+  --fin-libs "$ROOT/.toolchain/lib/std" \
+  -I "$ROOT/fin-auth/src" -I "$ROOT/fin-crypto/src" -I "$ROOT/finson/src" \
+  -O0 -o "$ROOT/fin-auth/test_auth"
+"$ROOT/fin-auth/test_auth"
+```
 
-- JWT: HS256 only (no RS256/ECDSA — needs bignum or FFI).
-- PBKDF2 at 10,000 iterations (below OWASP's 210k+ recommendation; pure-Fin
-  SHA-256 keeps interactive hashing affordable — raise once finc optimizes
-  or a native KDF lands).
-- Session store is in-memory and single-process (no persistence, no
-  distribution).
-- `crypt(3)` may fail to link where `libcrypt` isn't linked by default.
+The malformed-input subprocess probes use POSIX `fork`, `waitpid`, and `_exit`.
+They are test-only, not dependencies of the library API. Run the crypt test by
+compiling `tests/test_auth_crypt.fin` with `-c -o test_auth_crypt.o`, then linking
+with `cc test_auth_crypt.o -lcrypt -lm -o test_auth_crypt.exe`.
+
+## Remaining limitations
+
+- Coordinated dependency releases and manifest updates are still required.
+- JWT: HS256 and one exact header only; no key rotation/JWKS or replay store.
+- The explicitly named legacy password policy remains 10,000 iterations and is
+  not appropriate for new production hashes. The default is 600,000; deployment
+  benchmarking and login rate limiting remain application responsibilities.
+- The diagnostic `auth_pbkdf2_hex` retains programmer assertions on invalid
+  parameters; use the policy password APIs for untrusted authentication inputs.
+- Sessions remain linear-scan, in-memory, single-threaded/single-process, without
+  persistence, distribution, ownership isolation, or complete backing-buffer cleanup.
+- `crypt(3)` remains experimental and uses process-static storage; it may fail
+  to link without libcrypt and is unsuitable for concurrent calls without locking.
+- No claim of constant-time machine-code proof or process-wide leak freedom is made.
 
 ## Changelog
 
