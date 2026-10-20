@@ -1,0 +1,6 @@
+// finn package-export placeholder, following `finn init --template library`.
+// NOTE (verified 2026-10-19): `export * from ...` is NOT valid Fin syntax —
+// the Fin grammar has no `export` keyword and finc will reject this file.
+// finn generates it anyway as an aspirational package-export convention.
+// Do NOT run finc on this file until finn/finc define the re-export syntax.
+export * from "src/auth";

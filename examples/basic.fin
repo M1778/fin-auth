@@ -1,0 +1,31 @@
+// Basic fin-auth example: register a user (password hash), log in (verify +
+// JWT), and create a session.
+//
+// Run: finc examples/basic.fin -I src -o basic && ./basic
+
+import { password_hash, password_verify, jwt_encode, jwt_decode, session_store_new, session_create, session_get, session_free, csrf_token, JwtResult, SessionStore } from auth::fin;
+
+fun main() <noret> {
+    // Registration: store only the hash, never the password.
+    let hash <string> = password_hash("correct-horse-battery-staple");
+    printf("stored hash: %s\n", hash);
+
+    // Login: verify, then mint a JWT.
+    if (password_verify("correct-horse-battery-staple", hash)) {
+        let token <string> = jwt_encode("{\"sub\":\"user-42\",\"role\":\"member\"}", "server-secret");
+        printf("jwt: %s\n", token);
+        let dec <JwtResult> = jwt_decode(token, "server-secret");
+        if (dec.ok) {
+            printf("verified payload: %s\n", dec.payload_json);
+        }
+    }
+
+    // Server-side sessions.
+    let store <&SessionStore> = session_store_new();
+    let sess <string> = session_create(store, "user-42", 3600);
+    printf("session for %s\n", session_get(store, sess));
+    session_free(store);
+
+    // CSRF token for a form.
+    printf("csrf: %s\n", csrf_token());
+}

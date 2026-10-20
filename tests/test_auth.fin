@@ -1,0 +1,123 @@
+// fin-auth test suite.
+//
+// Run: finc tests/test_auth.fin -I src -o test_auth && ./test_auth
+// (from the repo root).
+//
+// Vectors: PBKDF2-HMAC-SHA256 from Python hashlib.pbkdf2_hmac, JWT HS256 from
+// Python hmac+base64 (independent implementation), crypt(3) $6$ from Python's
+// crypt module. The crypt test only runs where libc crypt links (marked).
+
+import { auth_b64url_encode, auth_b64url_decode, auth_free_bytes, auth_pbkdf2_hex, password_hash, password_verify, password_hash_crypt, jwt_encode, jwt_decode, jwt_decode_unverified, jwt_claim, jwt_exp, jwt_is_expired, session_store_new, session_free, session_create, session_get, session_destroy, session_sweep, csrf_token, csrf_check, AuthBytes, JwtResult, JwtClaimResult, CryptResult, SessionStore } from auth::fin;
+import { assert_true } from testing::std;
+import { equals, len, starts_with, contains } from strings::std;
+import { to_chars } from strings::std;
+
+fun main() <noret> {
+    // --- base64url ---
+    let foobar <[char]> = to_chars("foobar");
+    assert_true(equals(auth_b64url_encode(foobar, 6), "Zm9vYmFy"), "b64url('foobar')");
+    delete foobar;
+    // 16 bytes 0..15 -> no padding in base64url
+    let seq <[char]> = new [char, 17]{};
+    for (let i <int> = 0; i < 16; i++) { seq[i] = cast<char>(i); }
+    seq[16] = cast<char>(0);
+    assert_true(equals(auth_b64url_encode(seq, 16), "AAECAwQFBgcICQoLDA0ODw"), "b64url(0..15) unpadded");
+    let rt <AuthBytes> = auth_b64url_decode("AAECAwQFBgcICQoLDA0ODw");
+    assert_true(rt.len == 16, "b64url decode length");
+    let same <bool> = true;
+    for (let i <int> = 0; i < 16; i++) {
+        if (rt.data[i] != seq[i]) { same = false; }
+    }
+    assert_true(same, "b64url round-trip");
+    auth_free_bytes(&rt);
+    delete seq;
+    let bad <AuthBytes> = auth_b64url_decode("!!");
+    assert_true(bad.len == -1, "b64url rejects bad input");
+    auth_free_bytes(&bad);
+
+    // --- PBKDF2-HMAC-SHA256, Python hashlib.pbkdf2_hmac vectors ---
+    assert_true(equals(auth_pbkdf2_hex("password", "c2FsdHlzYWx0MTIzNDU2Nzg", 10000), "24480fdbad2fa35c590bae5cf2e6294203cc0d761173b57fd1ce21e49b7fdcba"), "pbkdf2 vector 1");
+    assert_true(equals(auth_pbkdf2_hex("correct horse", "MDEyMzQ1Njc4OWFiY2RlZg", 10000), "4c8da0aedbd5d475b99f3dab058e2d72d96b98e8f96d9b34770f63f0d1e94517"), "pbkdf2 vector 2");
+
+    // --- password_hash / password_verify round-trip ---
+    let h <string> = password_hash("s3cr3t-p@ss");
+    assert_true(starts_with(h, "$pbkdf2-sha256$10000$"), "hash format prefix");
+    assert_true(password_verify("s3cr3t-p@ss", h), "correct password verifies");
+    assert_true(!password_verify("s3cr3t-p@ss!", h), "wrong password rejected");
+    assert_true(!password_verify("s3cr3t-p@ss", "$pbkdf2-sha256$10000$broken"), "malformed hash rejected");
+    assert_true(!password_verify("s3cr3t-p@ss", "not-a-hash"), "garbage rejected");
+    // Salts differ between hashes.
+    let h2 <string> = password_hash("s3cr3t-p@ss");
+    assert_true(!equals(h, h2), "salts are random");
+
+    // --- crypt(3) FFI, Python crypt module vector ---
+    // EXPERIMENTAL: needs libcrypt at link time; the assertion documents the
+    // expected value when it links.
+    let cr <CryptResult> = password_hash_crypt("password", "$6$saltysalt$");
+    if (cr.ok) {
+        assert_true(equals(cr.hash, "$6$saltysalt$gl2Dp0z9fD2n7opP4xJXmrqHVOUVPL1xc/nwGYUcLsTPSMv3wI0wU8NZwNkdtnjn8ycwtOv/t9gt.rn4H4h2b."), "crypt(3) $6$ vector");
+    } else {
+        printf("note: crypt(3) did not link here; vector not checked\n");
+    }
+
+    // --- JWT HS256, Python-generated vector ---
+    let token <string> = "<redacted>";
+    let dec <JwtResult> = jwt_decode(token, "secret");
+    assert_true(dec.ok, "jwt_decode valid token");
+    assert_true(equals(dec.payload_json, "{\"sub\":\"123\",\"name\":\"Eleanor\",\"iat\":1760947200}"), "jwt payload");
+    let badsec <JwtResult> = jwt_decode(token, "wrong");
+    assert_true(!badsec.ok, "wrong secret rejected");
+    // Tampered payload -> bad signature.
+    let tamp <string> = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjMiLCJuYW1lIjoiTWFsbG9yeSIsImlhdCI6MTc2MDk0NzIwMH0.c2lnbmF0dXJlLXNpZ25hdHVyZS1zaWduYXR1cmUtc2lnbmF0dQ";
+    let bt <JwtResult> = jwt_decode(tamp, "secret");
+    assert_true(!bt.ok, "tampered token rejected");
+    // alg=none must never verify.
+    let none_token <string> = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxMjMifQ.";
+    let bn <JwtResult> = jwt_decode(none_token, "secret");
+    assert_true(!bn.ok, "alg=none rejected");
+    assert_true(!jwt_decode("a.b", "secret").ok, "2-part token rejected");
+
+    // --- jwt round-trip through our own encoder ---
+    let payload <string> = "{\"sub\":\"u1\",\"role\":\"admin\"}";
+    let t2 <string> = jwt_encode(payload, "topsecret");
+    let d2 <JwtResult> = jwt_decode(t2, "topsecret");
+    assert_true(d2.ok, "own token verifies");
+    assert_true(equals(d2.payload_json, payload), "own token payload round-trip");
+    // Unverified path parses but must not be trusted.
+    let du <JwtResult> = jwt_decode_unverified(t2);
+    assert_true(du.ok && equals(du.payload_json, payload), "unverified decode parses");
+
+    // --- claims ---
+    let cl <JwtClaimResult> = jwt_claim(dec.payload_json, "name");
+    assert_true(cl.ok && equals(cl.value, "\"Eleanor\""), "jwt_claim name");
+    let cl2 <JwtClaimResult> = jwt_claim(dec.payload_json, "missing");
+    assert_true(!cl2.ok, "missing claim");
+    // exp handling in double space (no float->int casts: backend limit 5).
+    assert_true(jwt_exp(dec.payload_json) == 1760947200.0, "jwt_exp");
+    assert_true(jwt_is_expired(dec.payload_json, 1760947201.0), "expired after exp");
+    assert_true(!jwt_is_expired(dec.payload_json, 1760947199.0), "not expired before exp");
+    assert_true(jwt_is_expired(payload, 9999999999.0), "no exp -> treated expired");
+
+    // --- sessions ---
+    let store <&SessionStore> = session_store_new();
+    let tok <string> = session_create(store, "user-42", 3600);
+    assert_true(len(tok) == 64, "session token length");
+    assert_true(equals(session_get(store, tok), "user-42"), "session lookup");
+    assert_true(equals(session_get(store, "nope"), ""), "unknown token");
+    assert_true(session_destroy(store, tok), "destroy existing");
+    assert_true(!session_destroy(store, tok), "destroy twice fails");
+    assert_true(equals(session_get(store, tok), ""), "destroyed token gone");
+    let t2s <string> = session_create(store, "user-7", 3600);
+    assert_true(session_sweep(store) == 0, "nothing expired to sweep");
+    assert_true(equals(session_get(store, t2s), "user-7"), "survivor intact");
+    session_free(store);
+
+    // --- CSRF ---
+    let c1 <string> = csrf_token();
+    let c2 <string> = csrf_token();
+    assert_true(len(c1) == 64, "csrf token length");
+    assert_true(csrf_check(c1, c1), "csrf self-check");
+    assert_true(!csrf_check(c1, c2), "csrf mismatch");
+
+    printf("all fin-auth tests passed\n");
+}

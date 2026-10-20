@@ -1,0 +1,13 @@
+[project]
+name = "fin-auth"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "auth.fin"
+
+[packages]
+fin-crypto = "M1778/fin-crypto@0.1.0"
+finson = "M1778/finson@0.1.0"
+
+[scripts]
+check = "finc src/auth.fin"
+test = "finc tests/test_auth.fin -I src -o test_auth && ./test_auth"

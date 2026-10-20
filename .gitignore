@@ -1,0 +1,7 @@
+.finn/
+out/
+*.o
+*.obj
+*.exe
+test_auth
+basic

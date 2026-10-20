@@ -1,0 +1,685 @@
+// SPDX-License-Identifier: MIT
+// fin-auth v0.1.0 — authentication & sessions for Fin.
+//
+// Scope: JWT (HS256) encode/verify, password hashing (PBKDF2-HMAC-SHA256,
+// primary; crypt(3) via C FFI, experimental), an in-memory session store,
+// CSRF token helpers. The crypto-primitive/application-layer split is kept
+// clean: all primitives (HMAC, CSPRNG, constant-time compare) come from
+// fin-crypto; this module is the application layer on top.
+//
+// Two documented implementation notes:
+//   1. fin-crypto exposes HMAC as hex strings only (no raw-bytes API in
+//      v0.1.0), and std base64_encode is strlen-limited (cannot encode binary
+//      digests). So this module carries small local helpers: auth_hex_to_bytes
+//      and explicit-length base64url encode/decode. Proposed as fin-crypto /
+//      std additions; see README and NOTES.
+//   2. crypt(3) is bound with its exact C ABI (char *crypt(const char *key,
+//      const char *salt)) and copied out via snprintf %s (variadic @define,
+//      the pattern Builder #1 verified). It is EXPERIMENTAL: on modern glibc
+//      crypt lives in libcrypt, not libc, so linking may fail — the PBKDF2
+//      path is the supported default.
+//
+// STATUS: written against docs/agent-guide.md (Fin v0.4.0). UNVERIFIED — no
+// working finc binary in this environment; nothing below has been
+// type-checked or executed. See README.md "Verification status".
+//
+// Backend limits respected (Builder #1 NOTES, finc 0.4.0): no `const`, no
+// enum-typed struct fields, parallel Collection<string>/Collection<long> for
+// the session store (no Collection<StructType>), no float->int casts (JWT exp
+// is compared in double space), explicit & on address-taking.
+
+#[stdimport] %{
+import { bit_xor } from bits::std;
+import { to_chars, from_chars, equals, concat, substr, find, trim, len, starts_with, parse_int } from strings::std;
+import { now } from time::std;
+import { Collection } from collection::std;
+import { hmac_sha256_bytes_hex, random_bytes, random_hex, const_time_eq } from crypto::fin;
+import { json_parse, json_stringify, json_object_get, json_free_result, JsonValue, ParseResult } from finson::fin;
+}%
+
+namespace fin {
+
+// --- private helpers ---
+
+priv fun byte_at(b: [char], i: int) <uint> {
+    let v <int> = cast<int>(b[i]);
+    if (v < 0) { v = v + 256; }
+    return cast<uint>(v);
+}
+
+// Byte buffer returned by value; the caller owns `data`.
+#[export]
+pub struct AuthBytes {
+    pub:
+        data <[char]>,
+        len <int>,
+}
+
+#[export]
+pub fun auth_free_bytes(b: &AuthBytes) <noret> {
+    delete b.data;
+}
+
+// --- base64url over byte arrays (explicit length; see header note 1) ---
+
+priv fun b64u_char(v: uint) <char> {
+    if (v < cast<uint>(26)) { return cast<char>(cast<int>('A') + cast<int>(v)); }
+    if (v < cast<uint>(52)) { return cast<char>(cast<int>('a') + cast<int>(v) - 26); }
+    if (v < cast<uint>(62)) { return cast<char>(cast<int>('0') + cast<int>(v) - 52); }
+    if (v == cast<uint>(62)) { return '-'; }
+    return '_';
+}
+
+// base64url WITHOUT padding (RFC 4648 section 5, RFC 7515): the JWT encoding.
+#[export]
+pub fun auth_b64url_encode(data: [char], len: int) <string> {
+    blame len >= 0, "auth_b64url_encode: length must be non-negative";
+    let full <int> = len / 3;
+    let rem <int> = len % 3;
+    let out_len <int> = full * 4;
+    if (rem == 1) { out_len = out_len + 2; }
+    if (rem == 2) { out_len = out_len + 3; }
+    let out <[char]> = new [char, out_len + 1]{};
+    let o <int> = 0;
+    for (let g <int> = 0; g < full; g++) {
+        let i <int> = g * 3;
+        let v <uint> = byte_at(data, i) * cast<uint>(65536)
+                     + byte_at(data, i + 1) * cast<uint>(256)
+                     + byte_at(data, i + 2);
+        out[o] = b64u_char((v >> cast<uint>(18)) % cast<uint>(64));
+        out[o + 1] = b64u_char((v >> cast<uint>(12)) % cast<uint>(64));
+        out[o + 2] = b64u_char((v >> cast<uint>(6)) % cast<uint>(64));
+        out[o + 3] = b64u_char(v % cast<uint>(64));
+        o = o + 4;
+    }
+    if (rem > 0) {
+        let i <int> = full * 3;
+        let v <uint> = byte_at(data, i) * cast<uint>(65536);
+        if (rem == 2) { v = v + byte_at(data, i + 1) * cast<uint>(256); }
+        out[o] = b64u_char((v >> cast<uint>(18)) % cast<uint>(64));
+        out[o + 1] = b64u_char((v >> cast<uint>(12)) % cast<uint>(64));
+        if (rem == 2) { out[o + 2] = b64u_char((v >> cast<uint>(6)) % cast<uint>(64)); }
+    }
+    out[out_len] = cast<char>(0);
+    let s <string> = from_chars(out, 0, out_len);
+    delete out;
+    return s;
+}
+
+priv fun b64u_val(c: char) <int> {
+    if (c >= 'A' && c <= 'Z') { return cast<int>(c) - cast<int>('A'); }
+    if (c >= 'a' && c <= 'z') { return cast<int>(c) - cast<int>('a') + 26; }
+    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0') + 52; }
+    if (c == '-') { return 62; }
+    if (c == '_') { return 63; }
+    return -1;
+}
+
+// base64url decode; tolerates missing padding (adds it back). ok is reported
+// via len == -1 on malformed input.
+#[export]
+pub fun auth_b64url_decode(s: string) <AuthBytes> {
+    let n <int> = len(s);
+    // Re-pad to a multiple of 4.
+    let pad <int> = (4 - (n % 4)) % 4;
+    let total <int> = n + pad;
+    let chars <[char]> = to_chars(s);
+    let out_len <int> = (total / 4) * 3 - pad;
+    let out <[char]> = new [char, out_len + 1]{};
+    let o <int> = 0;
+    let ok <bool> = true;
+    for (let i <int> = 0; i < total; i = i + 4) {
+        let c0 <char> = cast<char>('A');
+        let c1 <char> = cast<char>('A');
+        let c2 <char> = cast<char>('A');
+        let c3 <char> = cast<char>('A');
+        if (i < n) { c0 = chars[i]; }
+        if (i + 1 < n) { c1 = chars[i + 1]; }
+        if (i + 2 < n) { c2 = chars[i + 2]; }
+        if (i + 3 < n) { c3 = chars[i + 3]; }
+        let v0 <int> = b64u_val(c0);
+        let v1 <int> = b64u_val(c1);
+        let v2 <int> = b64u_val(c2);
+        let v3 <int> = b64u_val(c3);
+        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) { ok = false; }
+        let v <int> = v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+        if (o < out_len) { out[o] = cast<char>(v / 65536); o = o + 1; }
+        if (o < out_len) { out[o] = cast<char>((v / 256) % 256); o = o + 1; }
+        if (o < out_len) { out[o] = cast<char>(v % 256); o = o + 1; }
+    }
+    delete chars;
+    out[out_len] = cast<char>(0);
+    if (!ok) {
+        delete out;
+        return AuthBytes{data: new [char, 1]{}, len: -1};
+    }
+    return AuthBytes{data: out, len: out_len};
+}
+
+// --- hex helpers ---
+
+priv fun hex_val(c: char) <int> {
+    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0'); }
+    if (c >= 'a' && c <= 'f') { return cast<int>(c) - cast<int>('a') + 10; }
+    if (c >= 'A' && c <= 'F') { return cast<int>(c) - cast<int>('A') + 10; }
+    return -1;
+}
+
+// Lowercase/uppercase hex string -> raw bytes. Empty array on bad input
+// (caller checks length).
+priv fun auth_hex_to_bytes(hex: string) <[char]> {
+    let n <int> = len(hex);
+    if (n % 2 != 0) { return new [char, 0]{}; }
+    let out <[char]> = new [char, n / 2 + 1]{};
+    let chars <[char]> = to_chars(hex);
+    let ok <bool> = true;
+    for (let i <int> = 0; i < n; i = i + 2) {
+        let hi <int> = hex_val(chars[i]);
+        let lo <int> = hex_val(chars[i + 1]);
+        if (hi < 0 || lo < 0) { ok = false; }
+        out[i / 2] = cast<char>(hi * 16 + lo);
+    }
+    delete chars;
+    out[n / 2] = cast<char>(0);
+    if (!ok) {
+        delete out;
+        return new [char, 0]{};
+    }
+    return out;
+}
+
+// --- HMAC-SHA256 with raw byte output ---
+// fin-crypto v0.1.0 only returns hex, so convert (no crypto duplicated).
+
+priv fun hmac_raw(key: [char], key_len: int, msg: [char], msg_len: int) <[char]> {
+    let hex <string> = hmac_sha256_bytes_hex(key, key_len, msg, msg_len);
+    let raw <[char]> = auth_hex_to_bytes(hex);
+    blame raw.length == 33, "hmac_raw: expected 32 HMAC bytes";
+    return raw;
+}
+
+// --- PBKDF2-HMAC-SHA256 (RFC 8018) ---
+// The supported password hash. Pure Fin over fin-crypto's HMAC; test vectors
+// generated with Python hashlib.pbkdf2_hmac.
+
+// iterations and dk_len are ints; dk_len <= 32 * blocks handled by truncation.
+priv fun pbkdf2(password: [char], pw_len: int, salt: [char], salt_len: int, iterations: int, dk_len: int) <[char]> {
+    blame iterations > 0, "pbkdf2: iterations must be positive";
+    blame dk_len > 0, "pbkdf2: derived key length must be positive";
+    let blocks <int> = (dk_len + 31) / 32;
+    let dk <[char]> = new [char, dk_len + 1]{};
+    for (let b <int> = 1; b <= blocks; b++) {
+        // msg = salt || INT32_BE(b)
+        let msg <[char]> = new [char, salt_len + 5]{};
+        for (let i <int> = 0; i < salt_len; i++) { msg[i] = salt[i]; }
+        msg[salt_len] = cast<char>((b >> 24) % 256);
+        msg[salt_len + 1] = cast<char>((b >> 16) % 256);
+        msg[salt_len + 2] = cast<char>((b >> 8) % 256);
+        msg[salt_len + 3] = cast<char>(b % 256);
+        msg[salt_len + 4] = cast<char>(0);
+        let u <[char]> = hmac_raw(password, pw_len, msg, salt_len + 4);
+        delete msg;
+        let t <[char]> = new [char, 33]{};
+        for (let i <int> = 0; i < 32; i++) { t[i] = u[i]; }
+        t[32] = cast<char>(0);
+        for (let r <int> = 1; r < iterations; r++) {
+            let u2 <[char]> = hmac_raw(password, pw_len, u, 32);
+            delete u;
+            u = u2;
+            for (let i <int> = 0; i < 32; i++) {
+                let x <uint> = bit_xor(byte_at(t, i), byte_at(u, i));
+                t[i] = cast<char>(cast<int>(x));
+            }
+        }
+        delete u;
+        let off <int> = (b - 1) * 32;
+        let take <int> = 32;
+        if (off + take > dk_len) { take = dk_len - off; }
+        for (let i <int> = 0; i < take; i++) { dk[off + i] = t[i]; }
+        delete t;
+    }
+    dk[dk_len] = cast<char>(0);
+    return dk;
+}
+
+priv fun auth_hex_digit(v: uint) <char> {
+    if (v < cast<uint>(10)) {
+        return cast<char>(cast<int>('0') + cast<int>(v));
+    }
+    return cast<char>(cast<int>('a') + cast<int>(v) - 10);
+}
+
+// --- password hashing (PBKDF2-HMAC-SHA256, supported default) ---
+//
+// Stored format: $pbkdf2-sha256$<iterations>$<salt b64url>$<hash b64url>
+// v0.1.0 uses 10,000 iterations: enough to be real key stretching while the
+// pure-Fin SHA-256 keeps hashing interactive. Raise toward 200k+ once finc
+// optimizes or a native KDF lands (tracked in README).
+
+// Diagnostic/ interop entry point: PBKDF2-HMAC-SHA256 as lowercase hex.
+// salt_b64 is base64url (the same encoding password_hash stores).
+#[export]
+pub fun auth_pbkdf2_hex(password: string, salt_b64: string, iterations: int) <string> {
+    blame iterations > 0, "auth_pbkdf2_hex: iterations must be positive";
+    let pw <[char]> = to_chars(password);
+    let pw_len <int> = pw.length - 1;
+    let salt <AuthBytes> = auth_b64url_decode(salt_b64);
+    blame salt.len > 0, "auth_pbkdf2_hex: bad salt encoding";
+    let dk <[char]> = pbkdf2(pw, pw_len, salt.data, salt.len, iterations, 32);
+    delete pw;
+    delete salt.data;
+    let out <[char]> = new [char, 65]{};
+    for (let i <int> = 0; i < 32; i++) {
+        let b <uint> = byte_at(dk, i);
+        out[i * 2] = auth_hex_digit(b >> cast<uint>(4));
+        out[i * 2 + 1] = auth_hex_digit(b % cast<uint>(16));
+    }
+    out[64] = cast<char>(0);
+    let s <string> = from_chars(out, 0, 64);
+    delete out;
+    delete dk;
+    return s;
+}
+
+#[export]
+pub fun password_hash(password: string) <string> {
+    let pw <[char]> = to_chars(password);
+    let pw_len <int> = pw.length - 1;
+    let salt <[char]> = random_bytes(16);
+    let dk <[char]> = pbkdf2(pw, pw_len, salt, 16, 10000, 32);
+    let salt_b64 <string> = auth_b64url_encode(salt, 16);
+    let hash_b64 <string> = auth_b64url_encode(dk, 32);
+    delete pw;
+    delete salt;
+    delete dk;
+    let h <string> = concat("$pbkdf2-sha256$10000$", salt_b64);
+    h = concat(h, "$");
+    h = concat(h, hash_b64);
+    return h;
+}
+
+// Split "a$b$c" on a separator into exactly 3 parts; ok=false otherwise.
+#[export]
+pub struct AuthParts3 {
+    pub:
+        ok <bool>,
+        a <string>,
+        b <string>,
+        c <string>,
+}
+
+priv fun split3(s: string, sep: char) <AuthParts3> {
+    let fail <AuthParts3> = AuthParts3{ok: false, a: "", b: "", c: ""};
+    let chars <[char]> = to_chars(s);
+    let n <int> = chars.length - 1;
+    let p1 <int> = -1;
+    let p2 <int> = -1;
+    for (let i <int> = 0; i < n; i++) {
+        if (chars[i] == sep) {
+            if (p1 < 0) { p1 = i; } else { p2 = i; break; }
+        }
+    }
+    delete chars;
+    if (p1 < 0 || p2 < 0) { return fail; }
+    // Exactly 3 parts: no further separator after p2.
+    let rest <string> = substr(s, p2 + 1, n - p2 - 1);
+    if (find(rest, "$") >= 0) { return fail; }
+    return AuthParts3{ok: true, a: substr(s, 0, p1), b: substr(s, p1 + 1, p2 - p1 - 1), c: rest};
+}
+
+#[export]
+pub fun password_verify(password: string, hash_str: string) <bool> {
+    // Format: $pbkdf2-sha256$<iter>$<salt>$<hash> -> strip the leading $.
+    if (!starts_with(hash_str, "$pbkdf2-sha256$")) { return false; }
+    let body <string> = substr(hash_str, 15, len(hash_str) - 15);
+    let parts <AuthParts3> = split3(body, '$');
+    if (!parts.ok) { return false; }
+    let iters <int> = parse_int(parts.a);
+    if (iters <= 0 || iters > 10000000) { return false; }
+    let salt <AuthBytes> = auth_b64url_decode(parts.b);
+    if (salt.len != 16) {
+        if (salt.len >= 0) { delete salt.data; }
+        return false;
+    }
+    let pw <[char]> = to_chars(password);
+    let pw_len <int> = pw.length - 1;
+    let dk <[char]> = pbkdf2(pw, pw_len, salt.data, salt.len, iters, 32);
+    delete salt.data;
+    delete pw;
+    let recomputed <string> = auth_b64url_encode(dk, 32);
+    delete dk;
+    // Constant-time compare of the encoded hashes (ASCII — no NUL issue).
+    return const_time_eq(recomputed, parts.c);
+}
+
+// --- crypt(3) via C FFI (EXPERIMENTAL — see header note 2) ---
+//
+// Exact C ABI: char *crypt(const char *key, const char *salt);
+// Returns a pointer to static storage (must be copied before the next call;
+// never freed). `setting` is the full Modular Crypt Format setting, e.g.
+// "$6$saltysalt$" (SHA-512 crypt) or "$2b$12$......................".
+
+#[llvm_name="crypt"]
+@define auth_crypt(key: string, salt: string) <&char>;
+
+// snprintf for copying the static crypt buffer into Fin-owned memory.
+// (Variadic @define — the pattern Builder #1 verified through imports.)
+#[llvm_name="snprintf"]
+@define auth_snprintf(buf: &char, size: ulong, fmt: string, src: &char) <int>;
+
+#[export]
+pub struct CryptResult {
+    pub:
+        ok <bool>,
+        hash <string>,
+        err <string>,
+}
+
+#[export]
+pub fun password_hash_crypt(password: string, setting: string) <CryptResult> {
+    let fail <CryptResult> = CryptResult{ok: false, hash: "", err: ""};
+    let p <&char> = auth_crypt(password, setting);
+    if (p == null) {
+        fail.err = "password_hash_crypt: crypt(3) failed (bad setting?)";
+        return fail;
+    }
+    let buf <[char]> = new [char, 257]{};
+    let n <int> = auth_snprintf(&buf[0], cast<ulong>(256), "%s", p);
+    if (n < 0 || n > 256) {
+        delete buf;
+        fail.err = "password_hash_crypt: snprintf failed";
+        return fail;
+    }
+    buf[n] = cast<char>(0);
+    let h <string> = from_chars(buf, 0, n);
+    delete buf;
+    return CryptResult{ok: true, hash: h, err: ""};
+}
+
+// --- JWT (RFC 7519), HS256 only in v0.1.0 ---
+
+#[export]
+pub struct JwtResult {
+    pub:
+        ok <bool>,
+        payload_json <string>,
+        err <string>,
+}
+
+// Fixed header; HS256 is the only algorithm this module speaks. The alg
+// field is still verified on decode (never accept "none").
+priv fun jwt_header_b64() <string> {
+    let h <[char]> = to_chars("{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+    let n <int> = h.length - 1;
+    let e <string> = auth_b64url_encode(h, n);
+    delete h;
+    return e;
+}
+
+priv fun jwt_sign(signing_input: string, secret: string) <string> {
+    let kb <[char]> = to_chars(secret);
+    let kl <int> = kb.length - 1;
+    let mb <[char]> = to_chars(signing_input);
+    let ml <int> = mb.length - 1;
+    let mac <[char]> = hmac_raw(kb, kl, mb, ml);
+    delete kb;
+    delete mb;
+    let sig <string> = auth_b64url_encode(mac, 32);
+    delete mac;
+    return sig;
+}
+
+// Encode claims (a JSON object string) into a compact JWT.
+#[export]
+pub fun jwt_encode(payload_json: string, secret: string) <string> {
+    let h <string> = jwt_header_b64();
+    let pb <[char]> = to_chars(payload_json);
+    let pl <int> = pb.length - 1;
+    let pe <string> = auth_b64url_encode(pb, pl);
+    delete pb;
+    let signing_input <string> = concat(concat(h, "."), pe);
+    let sig <string> = jwt_sign(signing_input, secret);
+    return concat(concat(signing_input, "."), sig);
+}
+
+// Split a compact JWT into its 3 parts.
+priv fun jwt_split(token: string) <AuthParts3> {
+    let fail <AuthParts3> = AuthParts3{ok: false, a: "", b: "", c: ""};
+    let chars <[char]> = to_chars(token);
+    let n <int> = chars.length - 1;
+    let p1 <int> = -1;
+    let p2 <int> = -1;
+    for (let i <int> = 0; i < n; i++) {
+        if (chars[i] == '.') {
+            if (p1 < 0) { p1 = i; } else { p2 = i; break; }
+        }
+    }
+    delete chars;
+    if (p1 < 0 || p2 < 0) { return fail; }
+    let tail <string> = substr(token, p2 + 1, n - p2 - 1);
+    if (find(tail, ".") >= 0) { return fail; }
+    return AuthParts3{ok: true, a: substr(token, 0, p1), b: substr(token, p1 + 1, p2 - p1 - 1), c: tail};
+}
+
+// Verify signature and return the payload JSON. Rejects alg != HS256 by
+// comparing the header segment against our fixed header (no "none", no
+// algorithm confusion).
+#[export]
+pub fun jwt_decode(token: string, secret: string) <JwtResult> {
+    let fail <JwtResult> = JwtResult{ok: false, payload_json: "", err: ""};
+    let parts <AuthParts3> = jwt_split(token);
+    if (!parts.ok) {
+        fail.err = "jwt_decode: not a 3-part compact JWT";
+        return fail;
+    }
+    if (!equals(parts.a, jwt_header_b64())) {
+        fail.err = "jwt_decode: unsupported or unexpected alg (only HS256)";
+        return fail;
+    }
+    let signing_input <string> = concat(concat(parts.a, "."), parts.b);
+    let want <string> = jwt_sign(signing_input, secret);
+    if (!const_time_eq(parts.c, want)) {
+        fail.err = "jwt_decode: bad signature";
+        return fail;
+    }
+    let payload <AuthBytes> = auth_b64url_decode(parts.b);
+    if (payload.len < 0) {
+        fail.err = "jwt_decode: payload is not valid base64url";
+        return fail;
+    }
+    let js <string> = from_chars(payload.data, 0, payload.len);
+    delete payload.data;
+    return JwtResult{ok: true, payload_json: js, err: ""};
+}
+
+// Parse without verifying. DANGEROUS — for inspection/debugging only;
+// never trust claims from this path.
+#[export]
+pub fun jwt_decode_unverified(token: string) <JwtResult> {
+    let fail <JwtResult> = JwtResult{ok: false, payload_json: "", err: ""};
+    let parts <AuthParts3> = jwt_split(token);
+    if (!parts.ok) {
+        fail.err = "jwt_decode_unverified: not a 3-part compact JWT";
+        return fail;
+    }
+    let payload <AuthBytes> = auth_b64url_decode(parts.b);
+    if (payload.len < 0) {
+        fail.err = "jwt_decode_unverified: payload is not valid base64url";
+        return fail;
+    }
+    let js <string> = from_chars(payload.data, 0, payload.len);
+    delete payload.data;
+    return JwtResult{ok: true, payload_json: js, err: ""};
+}
+
+#[export]
+pub struct JwtClaimResult {
+    pub:
+        ok <bool>,
+        value <string>,
+        err <string>,
+}
+
+// Extract one claim from verified payload JSON, stringified via finson
+// (strings come back quoted — that is finson's JSON, not a bug).
+#[export]
+pub fun jwt_claim(payload_json: string, name: string) <JwtClaimResult> {
+    let fail <JwtClaimResult> = JwtClaimResult{ok: false, value: "", err: ""};
+    let pr <ParseResult> = json_parse(payload_json);
+    if (!pr.ok) {
+        fail.err = "jwt_claim: payload is not valid JSON";
+        json_free_result(&pr);
+        return fail;
+    }
+    // pr.value.kind == 5 is object; anything else has no named claims.
+    // (Checked before json_object_get, which blames on non-objects.)
+    if (pr.value.kind != 5) {
+        json_free_result(&pr);
+        fail.err = "jwt_claim: payload is not a JSON object";
+        return fail;
+    }
+    let v <&JsonValue> = json_object_get(pr.value, name);
+    if (v == null) {
+        json_free_result(&pr);
+        fail.err = "jwt_claim: claim not present";
+        return fail;
+    }
+    let s <string> = json_stringify(v);
+    json_free_result(&pr);
+    return JwtClaimResult{ok: true, value: s, err: ""};
+}
+
+// Numeric "exp" claim as a double; -1 when missing/invalid. Compared in
+// double space: finc cannot lower float->int casts (backend limit 5).
+#[export]
+pub fun jwt_exp(payload_json: string) <double> {
+    let pr <ParseResult> = json_parse(payload_json);
+    if (!pr.ok) {
+        json_free_result(&pr);
+        return -1.0;
+    }
+    // finson kind codes: 0 null, 1 bool, 2 number, 3 string, 4 array, 5 object.
+    // Kind checked before json_object_get, which blames on non-objects.
+    if (pr.value.kind != 5) {
+        json_free_result(&pr);
+        return -1.0;
+    }
+    let v <&JsonValue> = json_object_get(pr.value, "exp");
+    if (v == null || v.kind != 2) {
+        json_free_result(&pr);
+        return -1.0;
+    }
+    let e <double> = v.num;
+    json_free_result(&pr);
+    return e;
+}
+
+#[export]
+pub fun jwt_is_expired(payload_json: string, now_unix: double) <bool> {
+    let e <double> = jwt_exp(payload_json);
+    if (e < 0.0) { return true; }
+    return e < now_unix;
+}
+
+// --- session store (in-memory) ---
+//
+// Parallel collections (backend limit 3: no Collection<StructType>):
+// tokens[i] belongs to user_ids[i] and expires[i].
+
+#[export]
+pub struct SessionStore {
+    pub:
+        tokens <&Collection<string>>,
+        user_ids <&Collection<string>>,
+        expires <&Collection<long>>,
+}
+
+#[export]
+pub fun session_store_new() <&SessionStore> {
+    let s <&SessionStore> = new SessionStore{
+        tokens: new Collection::<string>{},
+        user_ids: new Collection::<string>{},
+        expires: new Collection::<long>{}
+    };
+    return s;
+}
+
+#[export]
+pub fun session_free(store: &SessionStore) <noret> {
+    delete store.tokens;
+    delete store.user_ids;
+    delete store.expires;
+    delete store;
+}
+
+// Create a session for user_id living ttl_secs seconds. Returns the token
+// (a 64-hex-char random string) or "" on internal error.
+#[export]
+pub fun session_create(store: &SessionStore, user_id: string, ttl_secs: long) <string> {
+    blame ttl_secs > 0, "session_create: ttl must be positive";
+    let token <string> = random_hex(32);
+    store.tokens.push(token);
+    store.user_ids.push(user_id);
+    store.expires.push(now() + ttl_secs);
+    return token;
+}
+
+// Look up the user_id for a token; "" when unknown or expired. Expired
+// entries are left for session_sweep.
+#[export]
+pub fun session_get(store: &SessionStore, token: string) <string> {
+    let idx <int> = store.tokens.index_of(token);
+    if (idx < 0) { return ""; }
+    if (store.expires.get(idx) < now()) { return ""; }
+    return store.user_ids.get(idx);
+}
+
+// Destroy a session; false when the token was unknown.
+#[export]
+pub fun session_destroy(store: &SessionStore, token: string) <bool> {
+    let idx <int> = store.tokens.index_of(token);
+    if (idx < 0) { return false; }
+    let last <int> = store.tokens.len() - 1;
+    // Swap-remove to keep the parallel arrays aligned.
+    store.tokens.set(idx, store.tokens.get(last));
+    store.user_ids.set(idx, store.user_ids.get(last));
+    store.expires.set(idx, store.expires.get(last));
+    store.tokens.pop_last();
+    store.user_ids.pop_last();
+    store.expires.pop_last();
+    return true;
+}
+
+// Drop expired sessions. Returns how many were removed.
+#[export]
+pub fun session_sweep(store: &SessionStore) <int> {
+    let t <long> = now();
+    let removed <int> = 0;
+    let i <int> = 0;
+    while (i < store.tokens.len()) {
+        if (store.expires.get(i) < t) {
+            session_destroy(store, store.tokens.get(i));
+            removed = removed + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+    return removed;
+}
+
+// --- CSRF tokens ---
+
+// A fresh CSRF token: 64 hex chars from the CSPRNG. Store per session and
+// compare submissions with csrf_check.
+#[export]
+pub fun csrf_token() <string> {
+    return random_hex(32);
+}
+
+// Constant-time comparison (lengths are not secret).
+#[export]
+pub fun csrf_check(a: string, b: string) <bool> {
+    return const_time_eq(a, b);
+}
+
+}
