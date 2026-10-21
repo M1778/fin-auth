@@ -111,6 +111,7 @@ result is caller-owned (`free_str`), including empty input and invalid bounds.
 | `session_store_new() <&SessionStore>` / `session_free(store)` | Create/destroy |
 | `session_create(store, user_id, ttl_secs) <string>` | 64-hex-char token |
 | `session_get(store, token) <string>` | user_id, or `""` when unknown/expired |
+| `session_user_id_copy(store, token) <string>` | Caller-owned copy of the user_id; free with `free_str` |
 | `session_destroy(store, token) <bool>` | Invalidate |
 | `session_sweep(store) <int>` | Drop expired; returns count removed |
 | `session_create_at(store, user_id, ttl_secs, now_unix)` | Explicit-clock creation; invalid TTL/overflow returns empty literal |
@@ -119,11 +120,15 @@ result is caller-owned (`free_str`), including empty input and invalid bounds.
 
 Clock arguments are `long` Unix seconds. Existing wrappers call the real clock.
 Lookup/logout compare token bytes, so tokens reconstructed from cookies work.
-The current store borrows both token/user strings: callers must keep them alive
-while stored and free generated token strings after removal/free. The legacy
-`Collection` backing buffers have no disposal API in the frozen stdlib;
-`session_free` cannot reclaim those internal buffers. This remains a limitation,
-not a leak-free production store.
+
+**Ownership.** The store owns the token and user id it keeps: `session_create*`
+copies both, so the caller may free or reuse its strings immediately. The
+returned token from `session_create*` is caller-owned and must be freed with
+`free_str`. The string returned by `session_get`/`session_get_at` is the
+store's own copy — do **not** free it; use `session_user_id_copy` when the
+caller needs a string it owns. `session_free` releases every string and the
+backing buffers the store allocated. The store is still a linear scan, holds
+everything in memory, and is not persistent or shareable between processes.
 
 ### CSRF
 
@@ -144,6 +149,12 @@ One 600,000-iteration default hash measured **0.580 seconds at -O2** and
 hashing only). These are observations, not deployment latency guarantees.
 The suite hashes once with the default and otherwise uses explicit lower-cost
 policies/vectors. Existing optional `crypt(3)` tests and the example also run successfully.
+
+**Leak-free under LeakSanitizer at `-O0` and `-O2`.** The suite builds with
+`FIN_CC` pointing at a leak-sanitizer `cc` wrapper; it reports no leaks. The
+session store's rewrite is what made this true: the previous `Collection`
+backed store leaked 384 bytes of backing buffers that `session_free` could
+never reclaim, and the suite leaked 882 bytes in total. It now leaks zero.
 
 Reproduce from these checkouts (Bash; repeat with `-O2`):
 
@@ -191,7 +202,9 @@ availability can differ; the supplied SHA-512-crypt vector is validated on Linux
 - The diagnostic `auth_pbkdf2_hex` retains programmer assertions on invalid
   parameters; use the policy password APIs for untrusted authentication inputs.
 - Sessions remain linear-scan, in-memory, single-threaded/single-process, without
-  persistence, distribution, ownership isolation, or complete backing-buffer cleanup.
+  persistence or distribution. The store now owns its strings and frees them
+  and its buffers in `session_free`; it is not a leak-free production store in
+  any other sense.
 - `crypt(3)` remains experimental and uses process-static storage; it may fail
   to link without libcrypt and is unsuitable for concurrent calls without locking.
 - No claim of constant-time machine-code proof or process-wide leak freedom is made.

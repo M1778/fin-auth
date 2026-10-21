@@ -4,13 +4,13 @@
 // Raw HMAC and strict JWT parsing use the immutable dependency revisions in finn.toml.
 //
 // crypt(3) stays in the opt-in auth_crypt::fin module, linked with -lcrypt.
-// Tested with frozen finc 0.4.0 contract 3 at -O0 and -O2. Parallel collections
-// retain the existing SessionStore ABI; string comparisons are content-based.
+// Tested with frozen finc 0.4.0 contract 3 at -O0 and -O2. The session store
+// keeps parallel owned arrays (not Collections), so it can release its
+// buffers; string comparisons are content-based.
 
 #[stdimport] %{
-import { to_chars, from_chars, equals, concat, substr, find, len, starts_with, free_str } from strings::std;
+import { to_chars, from_chars, equals, concat, substr, find, len, starts_with, free_str, clone } from strings::std;
 import { now } from time::std;
-import { Collection } from collection::std;
 import { hmac_sha256_bytes, random_bytes, random_hex, const_time_eq } from crypto::fin;
 import { json_parse, json_parse_strict, json_stringify, json_object_get, json_array_len, json_array_get, json_free_result, JsonValue, ParseResult } from finson::fin;
 }%
@@ -713,32 +713,91 @@ pub fun jwt_is_expired(payload_json: string, now_unix: double) <bool> {
 
 // --- session store (in-memory) ---
 //
-// Parallel collections (backend limit 3: no Collection<StructType>):
+// Parallel owned arrays (backend limit 3: no array of structs):
 // tokens[i] belongs to user_ids[i] and expires[i].
+//
+// OWNERSHIP: the store owns its token and user_id strings. `session_create*`
+// copies both, so the caller may free or reuse its strings immediately -- the
+// previous version borrowed them, which meant a caller that freed a user id
+// right after creating a session left the store holding a dangling pointer.
+// The store also releases everything it owns in `session_free`, including the
+// backing buffers; the earlier `Collection`-backed store could not, because
+// the frozen standard library exposed no way to free a collection's buffer.
 
 #[export]
 pub struct SessionStore {
     pub:
-        tokens <&Collection<string>>,
-        user_ids <&Collection<string>>,
-        expires <&Collection<long>>,
+        tokens <[string]>,
+        user_ids <[string]>,
+        expires <[long]>,
+        count <int>,
+        capacity <int>,
 }
+
+// The store grows geometrically and refuses to exceed this many live
+// sessions. A bound keeps one unbounded array from turning a login endpoint
+// into an allocation amplifier. The number is written inline because the
+// backend does not lower a module-scope constant yet.
 
 #[export]
 pub fun session_store_new() <&SessionStore> {
+    // A fresh array handle: Fin has no null array, so the empty handle is the
+    // unallocated state, and the first `session_reserve` replaces it.
+    let empty_tokens <[string]>;
+    let empty_users <[string]>;
+    let empty_expires <[long]>;
     let s <&SessionStore> = new SessionStore{
-        tokens: new Collection::<string>{},
-        user_ids: new Collection::<string>{},
-        expires: new Collection::<long>{}
+        tokens: empty_tokens,
+        user_ids: empty_users,
+        expires: empty_expires,
+        count: 0,
+        capacity: 0
     };
     return s;
 }
 
+// Grow the three parallel arrays together so their indices stay aligned.
+priv fun session_reserve(store: &SessionStore) <bool> {
+    if (store.count < store.capacity) { return true; }
+    if (store.capacity >= 1048576) { return false; }
+    let cap <int> = store.capacity * 2;
+    if (cap < 8) { cap = 8; }
+    if (cap > 1048576) { cap = 1048576; }
+    let tokens <[string]> = new [string, cap]{};
+    let user_ids <[string]> = new [string, cap]{};
+    let expires <[long]> = new [long, cap]{};
+    for (let i <int> = 0; i < store.count; i++) {
+        tokens[i] = store.tokens[i];
+        user_ids[i] = store.user_ids[i];
+        expires[i] = store.expires[i];
+    }
+    if (store.tokens != null) { delete store.tokens; }
+    if (store.user_ids != null) { delete store.user_ids; }
+    if (store.expires != null) { delete store.expires; }
+    store.tokens = tokens;
+    store.user_ids = user_ids;
+    store.expires = expires;
+    store.capacity = cap;
+    return true;
+}
+
 #[export]
 pub fun session_free(store: &SessionStore) <noret> {
-    delete store.tokens;
-    delete store.user_ids;
-    delete store.expires;
+    for (let i <int> = 0; i < store.count; i++) {
+        free_str(store.tokens[i]);
+        free_str(store.user_ids[i]);
+    }
+    if (store.tokens != null) { delete store.tokens; }
+    if (store.user_ids != null) { delete store.user_ids; }
+    if (store.expires != null) { delete store.expires; }
+    let empty_tokens <[string]>;
+    let empty_users <[string]>;
+    let empty_expires <[long]>;
+    store.tokens = empty_tokens;
+    store.user_ids = empty_users;
+    store.expires = empty_expires;
+    store.count = 0;
+    store.capacity = 0;
     delete store;
 }
 
@@ -753,23 +812,32 @@ pub fun session_create(store: &SessionStore, user_id: string, ttl_secs: long) <s
 pub fun session_create_at(store: &SessionStore, user_id: string, ttl_secs: long, now_unix: long) <string> {
     // Bound addition before computing the deadline; bad inputs are recoverable.
     if (ttl_secs <= 0 || now_unix < 0 || now_unix > cast<long>(9223372036854775807) - ttl_secs) { return ""; }
+    if (!session_reserve(store)) { return ""; }
     let token <string> = random_hex(32);
-    store.tokens.push(token);
-    store.user_ids.push(user_id);
-    store.expires.push(now_unix + ttl_secs);
+    if (len(token) != 64) { free_str(token); return ""; }
+    // Copy both strings: the store owns what it keeps.
+    let owned_token <string> = clone(token);
+    let owned_user <string> = clone(user_id);
+    store.tokens[store.count] = owned_token;
+    store.user_ids[store.count] = owned_user;
+    store.expires[store.count] = now_unix + ttl_secs;
+    store.count = store.count + 1;
     return token;
 }
 
 priv fun session_index(store: &SessionStore, token: string) <int> {
     if (len(token) != 64) { return -1; }
-    for (let i <int> = 0; i < store.tokens.len(); i++) {
-        if (const_time_eq(store.tokens.get(i), token)) { return i; }
+    for (let i <int> = 0; i < store.count; i++) {
+        if (const_time_eq(store.tokens[i], token)) { return i; }
     }
     return -1;
 }
 
 // Look up the user_id for a token; "" when unknown or expired. Expired
 // entries are left for session_sweep.
+//
+// The returned user id is the store's own copy, so the caller must not free
+// it. Use `session_user_id_copy` for a string the caller owns.
 #[export]
 pub fun session_get(store: &SessionStore, token: string) <string> {
     return session_get_at(store, token, now());
@@ -779,8 +847,17 @@ pub fun session_get(store: &SessionStore, token: string) <string> {
 pub fun session_get_at(store: &SessionStore, token: string, now_unix: long) <string> {
     let idx <int> = session_index(store, token);
     if (idx < 0 || now_unix < 0) { return ""; }
-    if (now_unix >= store.expires.get(idx)) { return ""; }
-    return store.user_ids.get(idx);
+    if (now_unix >= store.expires[idx]) { return ""; }
+    return store.user_ids[idx];
+}
+
+// A caller-owned copy of the user id for a live token; "" when unknown or
+// expired. The caller frees it with `free_str`.
+#[export]
+pub fun session_user_id_copy(store: &SessionStore, token: string) <string> {
+    let idx <int> = session_index(store, token);
+    if (idx < 0) { return ""; }
+    return clone(store.user_ids[idx]);
 }
 
 // Destroy a session; false when the token was unknown.
@@ -788,14 +865,23 @@ pub fun session_get_at(store: &SessionStore, token: string, now_unix: long) <str
 pub fun session_destroy(store: &SessionStore, token: string) <bool> {
     let idx <int> = session_index(store, token);
     if (idx < 0) { return false; }
-    let last <int> = store.tokens.len() - 1;
-    // Swap-remove to keep the parallel arrays aligned.
-    store.tokens.set(idx, store.tokens.get(last));
-    store.user_ids.set(idx, store.user_ids.get(last));
-    store.expires.set(idx, store.expires.get(last));
-    store.tokens.pop_last();
-    store.user_ids.pop_last();
-    store.expires.pop_last();
+    let last <int> = store.count - 1;
+    // Swap-remove to keep the parallel arrays aligned. Assigning an array
+    // element copies the handle, so the removed entry's own strings are
+    // released before the moved entry's handles take their place: releasing
+    // them afterwards would free the moved entry's strings as well, and
+    // releasing nothing would leak the removed entry's.
+    if (idx != last) {
+        free_str(store.tokens[idx]);
+        free_str(store.user_ids[idx]);
+        store.tokens[idx] = store.tokens[last];
+        store.user_ids[idx] = store.user_ids[last];
+        store.expires[idx] = store.expires[last];
+    } else {
+        free_str(store.tokens[last]);
+        free_str(store.user_ids[last]);
+    }
+    store.count = last;
     return true;
 }
 
@@ -810,9 +896,9 @@ pub fun session_sweep_at(store: &SessionStore, now_unix: long) <int> {
     if (now_unix < 0) { return 0; }
     let removed <int> = 0;
     let i <int> = 0;
-    while (i < store.tokens.len()) {
-        if (now_unix >= store.expires.get(i)) {
-            session_destroy(store, store.tokens.get(i));
+    while (i < store.count) {
+        if (now_unix >= store.expires[i]) {
+            session_destroy(store, store.tokens[i]);
             removed = removed + 1;
         } else {
             i = i + 1;

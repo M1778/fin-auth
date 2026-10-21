@@ -8,9 +8,9 @@
 // crypt module. The crypt test only runs where libc crypt links (marked).
 
 import { auth_b64url_encode, auth_b64url_decode, auth_free_bytes, auth_pbkdf2_hex, password_hash, password_verify, jwt_encode, jwt_decode, jwt_decode_unverified, jwt_claim, jwt_exp, jwt_is_expired, session_store_new, session_free, session_create, session_get, session_destroy, session_sweep, csrf_token, csrf_check, AuthBytes, JwtResult, JwtClaimResult, SessionStore } from auth::fin;
-import { PasswordPolicy, password_policy_default, password_policy_legacy, password_hash_with_policy, password_verify_with_policy, password_needs_rehash, JwtPolicy, jwt_verify, session_create_at, session_get_at, session_sweep_at } from auth::fin;
+import { PasswordPolicy, password_policy_default, password_policy_legacy, password_hash_with_policy, password_verify_with_policy, password_needs_rehash, JwtPolicy, jwt_verify, session_create_at, session_get_at, session_sweep_at, session_user_id_copy } from auth::fin;
 import { assert_true } from testing::std;
-import { equals, len, starts_with, concat, substr, free_str, repeat } from strings::std;
+import { equals, len, starts_with, concat, substr, free_str, repeat, clone } from strings::std;
 import { to_chars } from strings::std;
 #c_ifdef FIN_TARGET_WINDOWS
 // No POSIX declarations/imports may reach the Windows linker. A malformed
@@ -138,6 +138,66 @@ fun hardening_tests() <noret> {
     session_free(store);
     free_str(cookie); free_str(parsed); free_str(t1); free_str(t2); free_str(t3);
 
+    // --- session ownership ---
+    //
+    // The store copies the token and the user id, so a caller may free or
+    // reuse its strings right after creating a session. The earlier store
+    // borrowed them: a caller that freed a user id left the store holding a
+    // dangling pointer, and a freed string reused by the allocator made the
+    // next lookup return the wrong user.
+    let owned_store <&SessionStore> = session_store_new();
+    let scratch_user <string> = clone("user-original");
+    let owned_token <string> = session_create_at(owned_store, scratch_user, 60, 100);
+    assert_true(len(owned_token) == 64, "owned session token length");
+    assert_true(equals(session_get_at(owned_store, owned_token, 100), "user-original"), "session created with a user id");
+    // The caller frees its own copy; the store must be unaffected.
+    free_str(scratch_user);
+    let scratch_reuse <string> = clone("user-reused");
+    assert_true(equals(session_get_at(owned_store, owned_token, 100), "user-original"),
+        "the store keeps its own copy of the user id after the caller frees its own");
+    assert_true(equals(session_get_at(owned_store, owned_token, 100), "user-original"),
+        "the store's copy is stable across lookups");
+    free_str(scratch_reuse);
+
+    // A caller-owned copy of the user id, for a caller that must own the string.
+    let copied_user <string> = session_user_id_copy(owned_store, owned_token);
+    assert_true(equals(copied_user, "user-original"), "session_user_id_copy returns the user id");
+    free_str(copied_user);
+    let unknown_token <string> = repeat("0", 64);
+    assert_true(equals(session_user_id_copy(owned_store, unknown_token), ""),
+        "session_user_id_copy returns empty for an unknown token");
+    free_str(unknown_token);
+
+    // Swap-remove must not free the moved entry's strings: the moved entry
+    // still has to be readable afterwards, and its strings must not be
+    // released twice. Creating enough sessions to force a reallocation
+    // exercises the growth path as well.
+    let grow_store <&SessionStore> = session_store_new();
+    let grow_suffix <string> = concat("x", "y");
+    let grow_user <string> = concat("user-", grow_suffix);
+    free_str(grow_suffix);
+    let first_token <string> = "";
+    for (let i <int> = 0; i < 64; i++) {
+        let made <string> = session_create_at(grow_store, grow_user, 60, 100);
+        if (i == 0) { first_token = made; } else { free_str(made); }
+    }
+    assert_true(equals(session_get_at(grow_store, first_token, 100), "user-xy"),
+        "a session survives the store's reallocation");
+    session_free(grow_store);
+    free_str(grow_user);
+    free_str(first_token);
+    session_free(owned_store);
+    free_str(owned_token);
+
+    // The store must release everything it owns: a store freed with live
+    // sessions must not leak the tokens and user ids it copied.
+    let leak_store <&SessionStore> = session_store_new();
+    for (let i <int> = 0; i < 16; i++) {
+        let made <string> = session_create_at(leak_store, "leak-user", 60, 100);
+        free_str(made);
+    }
+    session_free(leak_store);
+
     let jp <JwtPolicy> = JwtPolicy{issuer: "issuer", audience: "api", clock_skew_secs: cast<double>(0.0)};
     let js <string> = "{\"iss\":\"issuer\",\"aud\":\"api\",\"exp\":200,\"nbf\":100}";
     expect_jwt(js, jp, cast<double>(100.0), true);
@@ -202,7 +262,8 @@ fun hardening_tests() <noret> {
     assert_true(!jwt_verify(signed, key, nan_skew, cast<double>(100.0)).ok, "NaN skew rejected");
     let decoded <JwtResult> = jwt_decode(signed, key);
     assert_true(decoded.ok, "signature-only decoding preserved");
-    free_str(decoded.payload_json); free_str(signed);
+    free_str(signed);
+    free_str(decoded.payload_json);
     assert_true(jwt_is_expired("{\"exp\":100}", cast<double>(100.0)), "legacy expiration equality fixed");
 #c_ifdef FIN_TARGET_WINDOWS
     printf("hardening regressions passed (12 in-process malformed-record probes)\n");
@@ -215,13 +276,17 @@ fun main() <noret> {
     hardening_tests();
     // --- base64url ---
     let foobar <[char]> = to_chars("foobar");
-    assert_true(equals(auth_b64url_encode(foobar, 6), "Zm9vYmFy"), "b64url('foobar')");
+    let foobar_encoded <string> = auth_b64url_encode(foobar, 6);
+    assert_true(equals(foobar_encoded, "Zm9vYmFy"), "b64url('foobar')");
+    free_str(foobar_encoded);
     delete foobar;
     // 16 bytes 0..15 -> no padding in base64url
     let seq <[char]> = new [char, 17]{};
     for (let i <int> = 0; i < 16; i++) { seq[i] = cast<char>(i); }
     seq[16] = cast<char>(0);
-    assert_true(equals(auth_b64url_encode(seq, 16), "AAECAwQFBgcICQoLDA0ODw"), "b64url(0..15) unpadded");
+    let encoded <string> = auth_b64url_encode(seq, 16);
+    assert_true(equals(encoded, "AAECAwQFBgcICQoLDA0ODw"), "b64url(0..15) unpadded");
+    free_str(encoded);
     let rt <AuthBytes> = auth_b64url_decode("AAECAwQFBgcICQoLDA0ODw");
     assert_true(rt.len == 16, "b64url decode length");
     let same <bool> = true;
@@ -236,8 +301,12 @@ fun main() <noret> {
     auth_free_bytes(&bad);
 
     // --- PBKDF2-HMAC-SHA256, Python hashlib.pbkdf2_hmac vectors ---
-    assert_true(equals(auth_pbkdf2_hex("password", "c2FsdHlzYWx0MTIzNDU2Nzg", 10000), "24480fdbad2fa35c590bae5cf2e6294203cc0d761173b57fd1ce21e49b7fdcba"), "pbkdf2 vector 1");
-    assert_true(equals(auth_pbkdf2_hex("correct horse", "MDEyMzQ1Njc4OWFiY2RlZg", 10000), "4c8da0aedbd5d475b99f3dab058e2d72d96b98e8f96d9b34770f63f0d1e94517"), "pbkdf2 vector 2");
+    let pbkdf1 <string> = auth_pbkdf2_hex("password", "c2FsdHlzYWx0MTIzNDU2Nzg", 10000);
+    assert_true(equals(pbkdf1, "24480fdbad2fa35c590bae5cf2e6294203cc0d761173b57fd1ce21e49b7fdcba"), "pbkdf2 vector 1");
+    free_str(pbkdf1);
+    let pbkdf2 <string> = auth_pbkdf2_hex("correct horse", "MDEyMzQ1Njc4OWFiY2RlZg", 10000);
+    assert_true(equals(pbkdf2, "4c8da0aedbd5d475b99f3dab058e2d72d96b98e8f96d9b34770f63f0d1e94517"), "pbkdf2 vector 2");
+    free_str(pbkdf2);
 
     // --- password_hash / password_verify round-trip ---
 #c_ifdef FIN_TARGET_WINDOWS
@@ -271,6 +340,8 @@ fun main() <noret> {
     // Salts differ between hashes.
     let h2 <string> = password_hash_with_policy("s3cr3t-p@ss", password_policy_legacy());
     assert_true(!equals(h, h2), "salts are random");
+    free_str(h);
+    free_str(h2);
 
     // crypt(3) lives in the opt-in auth_crypt::fin module (needs -lcrypt);
     // see tests/test_auth_crypt.fin.
@@ -301,12 +372,17 @@ fun main() <noret> {
     // Unverified path parses but must not be trusted.
     let du <JwtResult> = jwt_decode_unverified(t2);
     assert_true(du.ok && equals(du.payload_json, payload), "unverified decode parses");
+    free_str(t2);
+    free_str(d2.payload_json);
+    free_str(du.payload_json);
 
     // --- claims ---
     let cl <JwtClaimResult> = jwt_claim(dec.payload_json, "name");
     assert_true(cl.ok && equals(cl.value, "\"Eleanor\""), "jwt_claim name");
+    free_str(cl.value);
     let cl2 <JwtClaimResult> = jwt_claim(dec.payload_json, "missing");
     assert_true(!cl2.ok, "missing claim");
+    free_str(dec.payload_json);
     // exp handling in double space (no float->int casts: backend limit 5).
     // exp handling in double space (no float->int casts: backend limit 5).
     let exp_payload <string> = "{\"sub\":\"123\",\"exp\":1760947200}";
@@ -328,6 +404,8 @@ fun main() <noret> {
     assert_true(session_sweep(store) == 0, "nothing expired to sweep");
     assert_true(equals(session_get(store, t2s), "user-7"), "survivor intact");
     session_free(store);
+    free_str(tok);
+    free_str(t2s);
 
     // --- CSRF ---
     let c1 <string> = csrf_token();
@@ -337,6 +415,8 @@ fun main() <noret> {
     assert_true(!csrf_check(c1, c2), "csrf mismatch");
     assert_true(!csrf_check("", ""), "absent CSRF tokens rejected");
     assert_true(!csrf_check("a", "a"), "short equal CSRF tokens rejected");
+    free_str(c1);
+    free_str(c2);
     let valid_csrf <string> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let other_csrf <string> = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdee";
     let nonhex_csrf <string> = "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
