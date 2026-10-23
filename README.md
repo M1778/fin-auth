@@ -174,10 +174,10 @@ and the `clock_gettime` import are excluded from that Windows branch. The option
 hash benchmark uses Linux/macOS monotonic clock IDs; Windows skips timing but
 still hashes and verifies the emitted 600,000-iteration policy metadata.
 
-Native Windows x86-64/ARM64, macOS ARM64, and both Linux architectures passed
-this project's O0/O2 suite in [native run 40034272733](https://github.com/M1778/fin-sdk/actions/runs/40034272733),
-at auth revision `7b997f79b8fae031cbddfe54cce8ca59476a01af`. These are
-per-project results; that run found unrelated HTTP console-test failures.
+Native Linux, macOS and Windows, each on x86-64 and ARM64, passed this project's
+O0/O2 suite in [native run 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084),
+at auth revision `7b997f79b8fae031cbddfe54cce8ca59476a01af`. All thirteen
+projects passed across all six hosts in that run.
 It used externally verified compiler candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7`
 from Fin CI run `40028977601`, not a released compiler. Older published Fin
 revision `1f7afd97` lacks target selectors and cannot select these native
